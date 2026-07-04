@@ -175,7 +175,7 @@ def _discover_model_components(hf_model):
     # Find embedding (search from both hf_model and lm_root for VLM compatibility)
     EMBED_PATHS = [
         ('model', 'embed_tokens'), ('transformer', 'wte'),
-        ('model', 'decoder', 'embed_tokens'), ('embed_tokens',),
+        ('model', 'decoder', 'embed_tokens'), ('embed_tokens',), ('emb',),
     ]
     embedding = None
     for search_root in ([lm_root, hf_model] if is_vlm else [hf_model]):
@@ -197,7 +197,7 @@ def _discover_model_components(hf_model):
     # Find layers (search from lm_root for VLMs)
     LAYER_PATHS = [
         ('model', 'layers'), ('transformer', 'h'),
-        ('model', 'decoder', 'layers'), ('decoder', 'layers'), ('layers',),
+        ('model', 'decoder', 'layers'), ('decoder', 'layers'), ('layers',), ('blocks',),
     ]
     layers = None
     for search_root in ([lm_root, hf_model] if is_vlm else [hf_model]):
@@ -219,7 +219,7 @@ def _discover_model_components(hf_model):
     # Find final norm (search from lm_root for VLMs)
     NORM_PATHS = [
         ('model', 'norm'), ('transformer', 'ln_f'),
-        ('model', 'decoder', 'final_layer_norm'), ('norm',),
+        ('model', 'decoder', 'final_layer_norm'), ('norm',), ('ln_out',),
     ]
     norm = None
     for search_root in ([lm_root, hf_model] if is_vlm else [hf_model]):
@@ -244,6 +244,8 @@ def _discover_model_components(hf_model):
             break
     if lm_head is None:
         lm_head = getattr(getattr(hf_model, 'transformer', None), 'lm_head', None)
+    if lm_head is None:
+        lm_head = getattr(hf_model, 'head', None)
     if lm_head is None:
         raise AttributeError("Could not find lm_head")
 
@@ -319,7 +321,7 @@ class _GPUContext:
         'gpu_flat_buffers', 'cpu_flat_buffers',
         'gpu_layer_templates',
         'emb_gpu', 'norm_gpu', 'lm_head_gpu', 'rotary_gpu',
-        'compute_stream', 'weight_stream', 'grad_stream',
+        'compute_stream', 'weight_stream', 'grad_stream', 'act_stream',
         'weight_ready_events', 'h2d_done_events', 'backward_done_events',
         'buffer_busy_events', 'buffer_free_events', 'template_free_events',
         'param_sync_event', 'loss_backward_done', 'embedding_backward_done',
@@ -366,12 +368,23 @@ class CPUMasterModel:
         else:
             self._hf_model_type = ''
 
+        self.architecture = "rwkv7" if (
+            hasattr(hf_model, "blocks") and hasattr(hf_model, "emb") and hasattr(hf_model, "head")
+        ) else "transformer"
+        if self.architecture == "rwkv7" and config.world_size > 1:
+            raise NotImplementedError("RWKV7 CPUMasterModel currently supports single-GPU mode only")
+
         # Get config from the text/language model config if available
         cfg = getattr(hf_model.config, 'text_config', hf_model.config)
         self.vocab_size = cfg.vocab_size
-        self.hidden_size = cfg.hidden_size
-        self.num_heads = cfg.num_attention_heads
-        self.head_dim = cfg.hidden_size // cfg.num_attention_heads
+        self.hidden_size = getattr(cfg, 'hidden_size', getattr(cfg, 'n_embd', None))
+        if self.hidden_size is None:
+            raise AttributeError("Model config must expose hidden_size or n_embd")
+        self.num_heads = getattr(cfg, 'num_attention_heads', None)
+        if self.num_heads is None:
+            head_size = getattr(cfg, 'head_size', None)
+            self.num_heads = self.hidden_size // head_size if head_size else 1
+        self.head_dim = getattr(cfg, 'head_size', self.hidden_size // self.num_heads)
 
         # CPU master modules
         self.embedding = components['embedding'].cpu()
@@ -465,7 +478,7 @@ class CPUMasterModel:
         else:
             self._init_single_gpu(config)
 
-        logger.info(f"Model: {len(self.cpu_layers)} layers, checkpoint every {config.checkpoint_interval}")
+        logger.info(f"Model: {len(self.cpu_layers)} {self.architecture} layers, checkpoint every {config.checkpoint_interval}")
         logger.info(f"Max flattened param size per layer: {self.max_layer_numel * config.dtype.itemsize / 1024**2:.2f} MB")
         logger.info(f"Layer groups: {len(self.layer_groups)}")
         if not self.use_multiprocessing:
@@ -569,6 +582,7 @@ class CPUMasterModel:
         ctx.compute_stream = torch.cuda.current_stream(device=device)
         ctx.weight_stream = torch.cuda.Stream(device=device)
         ctx.grad_stream = torch.cuda.Stream(device=device)
+        ctx.act_stream = torch.cuda.Stream(device=device)
 
         # Synchronization events
         ctx.weight_ready_events = [torch.cuda.Event(enable_timing=False) for _ in range(2)]
@@ -928,6 +942,8 @@ class CPUMasterModel:
 
     def _build_layer_kwargs(self, mask, cache_position, position_ids, position_embeddings):
         """Build kwargs dict for layer forward, based on what the layer accepts."""
+        if self.architecture == "rwkv7":
+            return {}
         kwargs = {
             'attention_mask': mask,
             'use_cache': False,
@@ -940,6 +956,103 @@ class CPUMasterModel:
         if self.layer_accepts_position_ids and position_ids is not None:
             kwargs['position_ids'] = position_ids
         return kwargs
+
+    def _initial_layer_state(self, hidden):
+        """Return architecture-specific layer state carried across blocks."""
+        if self.architecture == "rwkv7":
+            return torch.empty_like(hidden)
+        return None
+
+    def _checkpoint_offload_enabled(self):
+        return self.architecture == "rwkv7" and getattr(self.config, "activation_offload", "none") == "cpu"
+
+    @staticmethod
+    def _to_pinned_cpu(tensor):
+        cpu = torch.empty(tensor.shape, dtype=tensor.dtype, device="cpu", pin_memory=True)
+        cpu.copy_(tensor.detach(), non_blocking=True)
+        return cpu
+
+    def _detach_checkpoint(self, hidden, layer_state, keep_gpu=False, ctx=None):
+        if self.architecture == "rwkv7":
+            if self._checkpoint_offload_enabled() and not keep_gpu:
+                hidden_cpu = torch.empty(hidden.shape, dtype=hidden.dtype, device="cpu", pin_memory=True)
+                state_cpu = torch.empty(layer_state.shape, dtype=layer_state.dtype, device="cpu", pin_memory=True)
+                event = torch.cuda.Event(enable_timing=False)
+                if ctx is not None:
+                    ctx.act_stream.wait_stream(ctx.compute_stream)
+                    with torch.cuda.stream(ctx.act_stream):
+                        hidden_cpu.copy_(hidden.detach(), non_blocking=True)
+                        state_cpu.copy_(layer_state.detach(), non_blocking=True)
+                        hidden.record_stream(ctx.act_stream)
+                        layer_state.record_stream(ctx.act_stream)
+                        event.record(ctx.act_stream)
+                else:
+                    hidden_cpu.copy_(hidden.detach(), non_blocking=True)
+                    state_cpu.copy_(layer_state.detach(), non_blocking=True)
+                    event.record(torch.cuda.current_stream(hidden.device))
+                return {
+                    "device": "cpu",
+                    "hidden": hidden_cpu,
+                    "state": state_cpu,
+                    "gpu_device": hidden.device,
+                    "d2h_event": event,
+                }
+            return (hidden.detach(), layer_state.detach())
+        return hidden.detach()
+
+    def _prefetch_checkpoint(self, checkpoint, ctx):
+        if not (self.architecture == "rwkv7" and isinstance(checkpoint, dict)):
+            return
+        if "hidden_gpu" in checkpoint:
+            return
+        hidden_gpu = torch.empty(checkpoint["hidden"].shape, dtype=checkpoint["hidden"].dtype, device=checkpoint["gpu_device"])
+        state_gpu = torch.empty(checkpoint["state"].shape, dtype=checkpoint["state"].dtype, device=checkpoint["gpu_device"])
+        event = torch.cuda.Event(enable_timing=False)
+        with torch.cuda.stream(ctx.act_stream):
+            ctx.act_stream.wait_event(checkpoint["d2h_event"])
+            hidden_gpu.copy_(checkpoint["hidden"], non_blocking=True)
+            state_gpu.copy_(checkpoint["state"], non_blocking=True)
+            event.record(ctx.act_stream)
+        checkpoint["hidden_gpu"] = hidden_gpu
+        checkpoint["state_gpu"] = state_gpu
+        checkpoint["h2d_event"] = event
+
+    def _release_prefetched_checkpoint(self, checkpoint):
+        if isinstance(checkpoint, dict):
+            checkpoint.pop("hidden_gpu", None)
+            checkpoint.pop("state_gpu", None)
+            checkpoint.pop("h2d_event", None)
+
+    def _unpack_checkpoint(self, checkpoint, ctx=None):
+        if self.architecture == "rwkv7":
+            if isinstance(checkpoint, dict):
+                if "hidden_gpu" not in checkpoint:
+                    if ctx is not None:
+                        self._prefetch_checkpoint(checkpoint, ctx)
+                    else:
+                        checkpoint["d2h_event"].synchronize()
+                        device = checkpoint["gpu_device"]
+                        checkpoint["hidden_gpu"] = checkpoint["hidden"].to(device, non_blocking=True)
+                        checkpoint["state_gpu"] = checkpoint["state"].to(device, non_blocking=True)
+                        checkpoint["h2d_event"] = torch.cuda.Event(enable_timing=False)
+                        checkpoint["h2d_event"].record(torch.cuda.current_stream(device))
+                if ctx is not None:
+                    ctx.compute_stream.wait_event(checkpoint["h2d_event"])
+                else:
+                    checkpoint["h2d_event"].synchronize()
+                hidden = checkpoint["hidden_gpu"]
+                state = checkpoint["state_gpu"]
+                return hidden, state
+            return checkpoint[0], checkpoint[1]
+        return checkpoint, None
+
+    def _run_gpu_layer(self, gpu_layer, hidden, layer_kwargs, layer_state=None):
+        """Run one GPU-resident layer for transformer or RWKV7 blocks."""
+        if self.architecture == "rwkv7":
+            return gpu_layer(hidden, layer_state)
+        out = gpu_layer(hidden, **layer_kwargs)
+        hidden = out[0] if isinstance(out, tuple) else out
+        return hidden, layer_state
 
     def _collect_layer_grads_async(self, layer_idx, buffer_idx, ctx):
         """Collect GPU buffer grads to CPU layer using K-slab flat buffer pool."""
@@ -1098,6 +1211,8 @@ class CPUMasterModel:
         Returns (hidden_after_norm, checkpoints, layer_kwargs, input_ids_gpu, B, T).
         """
         ctx = self.gpu_contexts[0]
+        if self._checkpoint_offload_enabled():
+            raise NotImplementedError("activation_offload=cpu is not wired for custom-loss RWKV7 path yet")
         B, T = input_ids.shape
 
         ctx.compute_stream.wait_event(ctx.param_sync_event)
@@ -1109,6 +1224,7 @@ class CPUMasterModel:
 
         input_ids_gpu = input_ids.to(ctx.device)
         hidden = ctx.emb_gpu(input_ids_gpu)
+        layer_state = self._initial_layer_state(hidden)
 
         if image_embeds is not None:
             hidden = self._merge_vision_embeddings(hidden, image_embeds, input_ids_gpu)
@@ -1146,7 +1262,7 @@ class CPUMasterModel:
                 next_buffer_idx = (i + 1) % 2
 
                 if i % self.config.checkpoint_interval == 0:
-                    checkpoints[i] = hidden.detach()
+                    checkpoints[i] = self._detach_checkpoint(hidden, layer_state, ctx=ctx)
 
                 if i + 1 < len(self.cpu_layers):
                     self._load_layer_to_buffer_async(i + 1, next_buffer_idx, ctx)
@@ -1158,10 +1274,9 @@ class CPUMasterModel:
                     ctx.buffer_busy_events[buffer_idx].record(ctx.compute_stream)
 
                     gpu_layer = self._get_gpu_layer(i, buffer_idx, ctx)
-                    out = gpu_layer(hidden, **layer_kwargs)
-                    hidden = out[0] if isinstance(out, tuple) else out
+                    hidden, layer_state = self._run_gpu_layer(gpu_layer, hidden, layer_kwargs, layer_state)
 
-        checkpoints[len(self.cpu_layers)] = hidden.detach()
+        checkpoints[len(self.cpu_layers)] = self._detach_checkpoint(hidden, layer_state, keep_gpu=True, ctx=ctx)
 
         if ctx.norm_gpu:
             hidden_after_norm = ctx.norm_gpu(hidden)
@@ -1272,6 +1387,7 @@ class CPUMasterModel:
 
         input_ids_gpu = input_ids.to(ctx.device)
         hidden = ctx.emb_gpu(input_ids_gpu)
+        layer_state = self._initial_layer_state(hidden)
 
         if image_embeds is not None:
             hidden = self._merge_vision_embeddings(hidden, image_embeds, input_ids_gpu)
@@ -1311,7 +1427,7 @@ class CPUMasterModel:
                 next_buffer_idx = (i + 1) % 2
 
                 if i % self.config.checkpoint_interval == 0:
-                    checkpoints[i] = hidden.detach()
+                    checkpoints[i] = self._detach_checkpoint(hidden, layer_state, ctx=ctx)
 
                 if i + 1 < len(self.cpu_layers):
                     self._load_layer_to_buffer_async(i + 1, next_buffer_idx, ctx)
@@ -1323,10 +1439,9 @@ class CPUMasterModel:
                     ctx.buffer_busy_events[buffer_idx].record(ctx.compute_stream)
 
                     gpu_layer = self._get_gpu_layer(i, buffer_idx, ctx)
-                    out = gpu_layer(hidden, **layer_kwargs)
-                    hidden = out[0] if isinstance(out, tuple) else out
+                    hidden, layer_state = self._run_gpu_layer(gpu_layer, hidden, layer_kwargs, layer_state)
 
-        checkpoints[len(self.cpu_layers)] = hidden.detach()
+        checkpoints[len(self.cpu_layers)] = self._detach_checkpoint(hidden, layer_state, keep_gpu=True, ctx=ctx)
 
         if ctx.norm_gpu:
             hidden = ctx.norm_gpu(hidden)
@@ -1338,7 +1453,8 @@ class CPUMasterModel:
         V = self.vocab_size
         chunk_size = 128
 
-        hidden_before_norm = checkpoints[len(self.cpu_layers)].requires_grad_(True)
+        final_hidden, final_state = self._unpack_checkpoint(checkpoints[len(self.cpu_layers)], ctx)
+        hidden_before_norm = final_hidden.requires_grad_(True)
         if ctx.norm_gpu:
             hidden_after_norm = ctx.norm_gpu(hidden_before_norm)
         else:
@@ -1384,6 +1500,7 @@ class CPUMasterModel:
         ctx.loss_backward_done.record(ctx.compute_stream)
 
         grad_hidden = hidden_before_norm.grad.detach()
+        grad_state = torch.zeros_like(final_state) if self.architecture == "rwkv7" else None
 
         # Collect lm_head/norm grads
         if not ctx.head_slab_free.wait(timeout=30.0):
@@ -1423,15 +1540,23 @@ class CPUMasterModel:
 
         # Backward through layers
         num_blocks = (len(self.cpu_layers) + self.config.checkpoint_interval - 1) // self.config.checkpoint_interval
+        if self._checkpoint_offload_enabled() and num_blocks > 0:
+            last_block_start = (num_blocks - 1) * self.config.checkpoint_interval
+            self._prefetch_checkpoint(checkpoints[last_block_start], ctx)
 
         for block_idx in range(num_blocks - 1, -1, -1):
             block_start = block_idx * self.config.checkpoint_interval
             block_end = min((block_idx + 1) * self.config.checkpoint_interval, len(self.cpu_layers))
 
             current_checkpoint = checkpoints[block_start]
+            checkpoint_hidden, checkpoint_state = self._unpack_checkpoint(current_checkpoint, ctx)
+            if self._checkpoint_offload_enabled() and block_idx > 0:
+                prev_block_start = (block_idx - 1) * self.config.checkpoint_interval
+                self._prefetch_checkpoint(checkpoints[prev_block_start], ctx)
 
             recompute_cache = {}
-            hidden_recompute = current_checkpoint
+            hidden_recompute = checkpoint_hidden
+            state_recompute = checkpoint_state
 
             with torch.no_grad():
                 for j in range(block_start, block_end):
@@ -1444,19 +1569,28 @@ class CPUMasterModel:
                         ctx.buffer_busy_events[buffer_idx].record(ctx.compute_stream)
 
                         gpu_layer = self._get_gpu_layer(j, buffer_idx, ctx)
-                        out = gpu_layer(hidden_recompute, **layer_kwargs)
-                        hidden_recompute = out[0] if isinstance(out, tuple) else out
+                        hidden_recompute, state_recompute = self._run_gpu_layer(
+                            gpu_layer, hidden_recompute, layer_kwargs, state_recompute
+                        )
 
-                    recompute_cache[j] = hidden_recompute.detach()
-                    del out
+                    recompute_cache[j] = self._detach_checkpoint(hidden_recompute, state_recompute, keep_gpu=True, ctx=ctx)
 
             for i in range(block_end - 1, block_start - 1, -1):
                 buffer_idx = i % 2
 
                 if i == block_start:
-                    layer_input = current_checkpoint.detach().requires_grad_(True)
+                    layer_input = checkpoint_hidden.detach().requires_grad_(True)
+                    state_input = (
+                        checkpoint_state.detach().requires_grad_(True)
+                        if self.architecture == "rwkv7" else None
+                    )
                 else:
-                    layer_input = recompute_cache[i - 1].requires_grad_(True)
+                    cached_hidden, cached_state = self._unpack_checkpoint(recompute_cache[i - 1], ctx)
+                    layer_input = cached_hidden.requires_grad_(True)
+                    state_input = (
+                        cached_state.requires_grad_(True)
+                        if self.architecture == "rwkv7" else None
+                    )
 
                 self._load_layer_to_buffer_async(i, buffer_idx, ctx)
                 ctx.compute_stream.wait_event(ctx.weight_ready_events[buffer_idx])
@@ -1470,19 +1604,33 @@ class CPUMasterModel:
                     for p in gpu_layer.parameters():
                         p.requires_grad_(True)
 
-                    out = gpu_layer(layer_input, **layer_kwargs)
-                    layer_output = out[0] if isinstance(out, tuple) else out
-
-                    grads = torch.autograd.grad(
-                        outputs=layer_output,
-                        inputs=(layer_input, *gpu_layer.parameters()),
-                        grad_outputs=grad_hidden,
-                        retain_graph=False,
-                        create_graph=False,
-                        allow_unused=True,
-                    )
-                    grad_hidden = grads[0].detach()
-                    param_grads = grads[1:]
+                    if self.architecture == "rwkv7":
+                        layer_output, state_output = self._run_gpu_layer(
+                            gpu_layer, layer_input, layer_kwargs, state_input
+                        )
+                        grads = torch.autograd.grad(
+                            outputs=(layer_output, state_output),
+                            inputs=(layer_input, state_input, *gpu_layer.parameters()),
+                            grad_outputs=(grad_hidden, grad_state),
+                            retain_graph=False,
+                            create_graph=False,
+                            allow_unused=True,
+                        )
+                        grad_hidden = grads[0].detach()
+                        grad_state = grads[1].detach() if grads[1] is not None else torch.zeros_like(state_input)
+                        param_grads = grads[2:]
+                    else:
+                        layer_output, _ = self._run_gpu_layer(gpu_layer, layer_input, layer_kwargs, None)
+                        grads = torch.autograd.grad(
+                            outputs=layer_output,
+                            inputs=(layer_input, *gpu_layer.parameters()),
+                            grad_outputs=grad_hidden,
+                            retain_graph=False,
+                            create_graph=False,
+                            allow_unused=True,
+                        )
+                        grad_hidden = grads[0].detach()
+                        param_grads = grads[1:]
 
                     for p, g in zip(gpu_layer.parameters(), param_grads):
                         p.grad = g
@@ -1496,9 +1644,10 @@ class CPUMasterModel:
 
                 if i in recompute_cache:
                     del recompute_cache[i]
-                del layer_input, layer_output, out
+                del layer_input, layer_output
 
             recompute_cache.clear()
+            self._release_prefetched_checkpoint(current_checkpoint)
 
         # === BACKWARD THROUGH EMBEDDING ===
         input_ids_gpu = input_ids.to(ctx.device)
@@ -1867,6 +2016,59 @@ class CPUMasterModel:
                 seen.add(id(p))
 
         return params
+
+    def optimizer_groups(self, weight_decay: float = 0.01):
+        """Return optimizer groups, preserving RWKV7 train_temp grouping when applicable."""
+        if self.architecture != "rwkv7":
+            return [{"params": self.get_parameters(), "weight_decay": weight_decay}]
+
+        named_params = []
+        named_params.extend((f"emb.{name}", p) for name, p in self.embedding.named_parameters())
+        for idx, layer in enumerate(self.cpu_layers):
+            named_params.extend((f"blocks.{idx}.{name}", p) for name, p in layer.named_parameters())
+        if self.norm is not None:
+            named_params.extend((f"ln_out.{name}", p) for name, p in self.norm.named_parameters())
+        named_params.extend((f"head.{name}", p) for name, p in self.lm_head.named_parameters())
+
+        lr_decay = []
+        lr_1x = []
+        lr_2x = []
+        seen = set()
+        for name, param in named_params:
+            if id(param) in seen:
+                continue
+            seen.add(id(param))
+            if "att.w0" in name:
+                lr_2x.append((name, param))
+            elif len(param.squeeze().shape) >= 2 and weight_decay > 0 and ".weight" in name:
+                lr_decay.append((name, param))
+            else:
+                lr_1x.append((name, param))
+
+        groups = [
+            {
+                "params": [p for _, p in sorted(lr_1x)],
+                "weight_decay": 0.0,
+                "my_lr_scale": 1.0,
+                "names": [n for n, _ in sorted(lr_1x)],
+            },
+            {
+                "params": [p for _, p in sorted(lr_2x)],
+                "weight_decay": 0.0,
+                "my_lr_scale": 2.0,
+                "names": [n for n, _ in sorted(lr_2x)],
+            },
+        ]
+        if weight_decay > 0:
+            groups.append(
+                {
+                    "params": [p for _, p in sorted(lr_decay)],
+                    "weight_decay": weight_decay,
+                    "my_lr_scale": 1.0,
+                    "names": [n for n, _ in sorted(lr_decay)],
+                }
+            )
+        return groups
 
     def zero_grad(self):
         for p in self.get_parameters():

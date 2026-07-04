@@ -77,6 +77,7 @@ class CPUMasterConfig:
     # Memory
     checkpoint_interval: int = 4
     num_grad_slabs: int = 12
+    activation_offload: str = "none"  # "none" or "cpu"; currently used by RWKV7 checkpoints
 
     # Logging
     log_interval: int = 1
@@ -101,6 +102,9 @@ class CPUMasterConfig:
                 f"num_grad_slabs ({self.num_grad_slabs}) < 2 * checkpoint_interval "
                 f"({2 * self.checkpoint_interval}). This may cause gradient slab starvation."
             )
+
+        if self.activation_offload not in ("none", "cpu"):
+            raise ValueError("activation_offload must be 'none' or 'cpu'")
 
         if not self.dataset_path and not self.dataset_name:
             raise ValueError("Must specify either dataset_path or dataset_name")

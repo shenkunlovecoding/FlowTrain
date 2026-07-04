@@ -71,6 +71,12 @@ KNOWN_MODELS = {
     "Yi1.5-34B":     {"params": 34,   "hidden": 7168, "layers": 60},
     "GPT-OSS-20B":   {"params": 20,   "hidden": 5120, "layers": 48},
     "GPT-OSS-120B":  {"params": 120,  "hidden": 10240,"layers": 96},
+    # RWKV-7 x070 examples
+    "RWKV7-0.1B":    {"params": 0.1,  "hidden": 768,  "layers": 12, "arch": "rwkv7", "head_size": 64},
+    "RWKV7-0.4B":    {"params": 0.4,  "hidden": 1024, "layers": 24, "arch": "rwkv7", "head_size": 64},
+    "RWKV7-1.5B":    {"params": 1.5,  "hidden": 2048, "layers": 24, "arch": "rwkv7", "head_size": 64},
+    "RWKV7-3B":      {"params": 3,    "hidden": 2560, "layers": 32, "arch": "rwkv7", "head_size": 64},
+    "RWKV7-7B":      {"params": 7,    "hidden": 4096, "layers": 32, "arch": "rwkv7", "head_size": 64},
 }
 
 # ============================================================
@@ -85,6 +91,20 @@ CUDA_CONTEXT_GB = 2.0
 DEFAULT_CHECKPOINT_INTERVAL = 4
 DEFAULT_NUM_GRAD_SLABS = 12
 HYBRID_OVERHEAD_FACTOR = 2.5  # hybrid attention uses ~2.5x more activation memory
+RWKV7_SAFETY_FACTOR = 1.25
+DEFAULT_RWKV7_HEAD_SIZE = 64
+DEFAULT_RWKV7_CHUNK_LEN = 16
+
+
+def model_tag(spec: dict) -> str:
+    tags = []
+    if spec.get("arch") == "rwkv7":
+        tags.append("RWKV7")
+    if spec.get("hybrid"):
+        tags.append("hybrid")
+    if spec.get("moe"):
+        tags.append("MoE")
+    return f" [{', '.join(tags)}]" if tags else ""
 
 
 def calc_cpu_memory(params_billion: float) -> float:
@@ -122,20 +142,43 @@ def calc_gpu_fixed(params_billion: float, num_layers: int,
     return CUDA_CONTEXT_GB + double_buf + grad_slabs + head_embed
 
 
-def calc_batch_size(gpu_memory_gb: float, params_billion: float,
-                    hidden_dim: int, num_layers: int, seq_len: int,
-                    checkpoint_interval: int = DEFAULT_CHECKPOINT_INTERVAL,
-                    is_hybrid: bool = False) -> int:
-    """Calculate maximum batch size.
-
-    Activation memory per sample:
-      ≈ hidden_dim * seq_len * checkpoint_interval * ACTIVATION_BYTES_FACTOR
-    """
-    fixed = calc_gpu_fixed(params_billion, num_layers)
-    available = gpu_memory_gb - fixed
-
-    if available <= 0:
-        return 0
+def calc_activation_per_sample_gb(
+    hidden_dim: int,
+    num_layers: int,
+    seq_len: int,
+    checkpoint_interval: int = DEFAULT_CHECKPOINT_INTERVAL,
+    arch: str = "transformer",
+    is_hybrid: bool = False,
+    head_size: int = DEFAULT_RWKV7_HEAD_SIZE,
+    chunk_len: int = DEFAULT_RWKV7_CHUNK_LEN,
+    activation_offload: str = "none",
+    dtype_bytes: int = 2,
+) -> float:
+    """Estimate batch-size-scaled GPU memory per sample in GB."""
+    if arch == "rwkv7":
+        # Current CPUMaster RWKV7 path keeps block checkpoints on GPU as
+        # (hidden, v_first), then stores a block-local recompute cache with the
+        # same pair. The fused recurrence also saves per-layer bf16 inputs plus
+        # fp32 state/sa scratch for backward.
+        checkpoints = math.ceil(num_layers / checkpoint_interval) + 1
+        if activation_offload == "cpu":
+            # CPU offload removes long-lived checkpoint residency, but the peak
+            # still includes final/current materialized checkpoints and CUDA
+            # allocator overlap during recompute. Empirically this retains about
+            # 70% of the no-offload checkpoint term for the 0.1B RWKV7 probe.
+            checkpoint_bytes = checkpoints * 2 * dtype_bytes * 0.70
+        else:
+            checkpoint_bytes = checkpoints * 2 * dtype_bytes
+        recompute_bytes = checkpoint_interval * 2 * dtype_bytes
+        recurrence_bytes = (
+            6 * dtype_bytes
+            + 4  # sa: [B,T,C] fp32
+            + 4 * head_size / max(chunk_len, 1)  # state: [B,H,T/chunk,N,N] fp32
+        )
+        per_hidden_token = (
+            checkpoint_bytes + recompute_bytes + recurrence_bytes
+        ) * RWKV7_SAFETY_FACTOR
+        return hidden_dim * seq_len * per_hidden_token / 1e9
 
     activation_per_sample = (
         hidden_dim * seq_len * checkpoint_interval * ACTIVATION_BYTES_FACTOR / 1e9
@@ -143,6 +186,38 @@ def calc_batch_size(gpu_memory_gb: float, params_billion: float,
 
     if is_hybrid:
         activation_per_sample *= HYBRID_OVERHEAD_FACTOR
+
+    return activation_per_sample
+
+
+def calc_batch_size(gpu_memory_gb: float, params_billion: float,
+                    hidden_dim: int, num_layers: int, seq_len: int,
+                    checkpoint_interval: int = DEFAULT_CHECKPOINT_INTERVAL,
+                    is_hybrid: bool = False,
+                    arch: str = "transformer",
+                    head_size: int = DEFAULT_RWKV7_HEAD_SIZE,
+                    chunk_len: int = DEFAULT_RWKV7_CHUNK_LEN,
+                    activation_offload: str = "none") -> int:
+    """Calculate maximum batch size."""
+    fixed = calc_gpu_fixed(params_billion, num_layers)
+    available = gpu_memory_gb - fixed
+
+    if available <= 0:
+        return 0
+
+    activation_per_sample = calc_activation_per_sample_gb(
+        hidden_dim,
+        num_layers,
+        seq_len,
+        checkpoint_interval=checkpoint_interval,
+        arch=arch,
+        is_hybrid=is_hybrid,
+        head_size=head_size,
+        chunk_len=chunk_len,
+        activation_offload=activation_offload,
+    )
+    if activation_per_sample <= 0:
+        return 0
 
     bs = int(available / activation_per_sample)
     return max(bs, 1)
@@ -229,12 +304,7 @@ def mode_batch_size():
     print("  Available models:")
     model_list = sorted(KNOWN_MODELS.items(), key=lambda x: x[1]["params"])
     for i, (name, spec) in enumerate(model_list):
-        tag = ""
-        if spec.get("hybrid"):
-            tag = " [hybrid]"
-        elif spec.get("moe"):
-            tag = " [MoE]"
-        print(f"    {i+1:>3}. {name} ({spec['params']}B){tag}")
+        print(f"    {i+1:>3}. {name} ({spec['params']}B){model_tag(spec)}")
 
     print(f"    {len(model_list)+1:>3}. Custom (enter params manually)")
     print()
@@ -253,6 +323,9 @@ def mode_batch_size():
         params = spec["params"]
         hidden = spec["hidden"]
         layers = spec["layers"]
+        arch = spec.get("arch", "transformer")
+        head_size = spec.get("head_size", DEFAULT_RWKV7_HEAD_SIZE)
+        chunk_len = spec.get("chunk_len", DEFAULT_RWKV7_CHUNK_LEN)
         is_hybrid = spec.get("hybrid", False)
         is_moe = spec.get("moe", False)
     else:
@@ -265,25 +338,82 @@ def mode_batch_size():
                 break
             except ValueError:
                 print("  Please enter valid numbers.")
+        while True:
+            arch_choice = input("  Architecture (transformer/rwkv7, default transformer): ").strip().lower()
+            if arch_choice in ("", "transformer", "rwkv7"):
+                break
+            print("  Please enter transformer or rwkv7.")
+        arch = arch_choice or "transformer"
+        if arch == "rwkv7":
+            while True:
+                try:
+                    head_size = int(input(f"  Enter RWKV7 head_size (default {DEFAULT_RWKV7_HEAD_SIZE}): ") or DEFAULT_RWKV7_HEAD_SIZE)
+                    chunk_len = int(input(f"  Enter RWKV7 CUDA chunk_len (default {DEFAULT_RWKV7_CHUNK_LEN}): ") or DEFAULT_RWKV7_CHUNK_LEN)
+                    break
+                except ValueError:
+                    print("  Please enter valid integers.")
+        else:
+            head_size = DEFAULT_RWKV7_HEAD_SIZE
+            chunk_len = DEFAULT_RWKV7_CHUNK_LEN
         is_hybrid = False
         is_moe = False
+
+    if arch == "rwkv7":
+        while True:
+            activation_offload = input("  RWKV7 activation_offload (none/cpu, default cpu): ").strip().lower() or "cpu"
+            if activation_offload in ("none", "cpu"):
+                break
+            print("  Please enter none or cpu.")
+    else:
+        activation_offload = "none"
+
+    default_ckpt = 1 if arch == "rwkv7" else DEFAULT_CHECKPOINT_INTERVAL
+    while True:
+        try:
+            checkpoint_interval = int(input(f"  Enter checkpoint_interval (default {default_ckpt}): ") or default_ckpt)
+            if checkpoint_interval > 0:
+                break
+        except ValueError:
+            pass
+        print("  Please enter a positive integer.")
 
     # Calculate
     cpu_needed = calc_cpu_memory(params)
     gpu_fixed = calc_gpu_fixed(params, layers)
+    activation_per_sample = calc_activation_per_sample_gb(
+        hidden,
+        layers,
+        seq_len,
+        checkpoint_interval=checkpoint_interval,
+        arch=arch,
+        is_hybrid=is_hybrid,
+        head_size=head_size,
+        chunk_len=chunk_len,
+        activation_offload=activation_offload,
+    )
     bs = calc_batch_size(gpu_mem, params, hidden, layers, seq_len,
-                         is_hybrid=is_hybrid)
+                         checkpoint_interval=checkpoint_interval,
+                         is_hybrid=is_hybrid,
+                         arch=arch,
+                         head_size=head_size,
+                         chunk_len=chunk_len,
+                         activation_offload=activation_offload)
 
     print()
     print(f"  {'='*50}")
     print(f"  Model:          {name} ({params}B params)")
+    print(f"  Architecture:   {arch}")
     print(f"  GPU memory:     {gpu_mem:.0f} GB")
     print(f"  Context length: {seq_len}")
+    print(f"  Checkpoint int: {checkpoint_interval}")
+    if arch == "rwkv7":
+        print(f"  Act offload:    {activation_offload}")
     print(f"  {'='*50}")
     print()
     print(f"  CPU memory needed:   {cpu_needed:>8.0f} GB")
     print(f"  GPU fixed overhead:  {gpu_fixed:>8.1f} GB")
     print(f"  GPU for activations: {max(gpu_mem - gpu_fixed, 0):>8.1f} GB")
+    print(f"  Activation/sample:   {activation_per_sample:>8.3f} GB")
     print()
 
     if bs <= 0:
@@ -310,11 +440,21 @@ def mode_batch_size():
             print()
             print(f"  NOTE: {name} is a MoE model. Actual memory varies by layer")
             print(f"  (dense vs expert layers). Start with the safe batch size.")
+        if arch == "rwkv7":
+            print()
+            print(f"  NOTE: RWKV7 estimate includes hidden + v_first checkpoints,")
+            print(f"  block recompute cache, and fused recurrence backward scratch.")
+            print(f"  It assumes bf16 recurrence with head_size={head_size}, chunk_len={chunk_len}.")
+            print(f"  activation_offload={activation_offload}.")
 
     print()
     print(f"  Add to your YAML config:")
     print(f"    training:")
     print(f"      batch_size: {max(bs, 1)}")
+    print(f"    memory:")
+    print(f"      checkpoint_interval: {checkpoint_interval}")
+    if arch == "rwkv7":
+        print(f"      activation_offload: {activation_offload}")
     print()
 
 

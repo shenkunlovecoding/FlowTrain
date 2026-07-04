@@ -92,6 +92,7 @@ def yaml_to_training_config(yaml_config: Dict[str, Any]) -> CPUMasterConfig:
         # Memory
         checkpoint_interval=memory_cfg.get('checkpoint_interval', 4),
         num_grad_slabs=memory_cfg.get('num_grad_slabs', 12),
+        activation_offload=memory_cfg.get('activation_offload', 'none'),
 
         # Logging
         log_interval=logging_cfg.get('log_interval', 1),
