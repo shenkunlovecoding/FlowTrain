@@ -8,6 +8,9 @@ from typing import Literal
 
 import torch
 
+from .rwkv7 import lora_ranks, official_rank
+from .trainer import _infer_rwkv7_dims, _parse_checkpoint_state
+
 
 ActivationOffload = Literal["none", "cpu"]
 ActivationQuant = Literal["none", "int8"]
@@ -47,22 +50,6 @@ class BatchSizeEstimate:
     model_params_b: float
     assumptions: tuple[str, ...]
 
-
-def official_lora_rank(channels: int, multiplier: float) -> int:
-    return max(32, int(round((multiplier * (channels**0.5)) / 32) * 32))
-
-
-def lora_ranks(channels: int, style: str) -> tuple[int, int, int, int]:
-    if style == "official":
-        return (
-            official_lora_rank(channels, 2.5),
-            official_lora_rank(channels, 2.5),
-            official_lora_rank(channels, 1.7),
-            official_lora_rank(channels, 5.0),
-        )
-    if style == "simplified":
-        return 8, 8, 8, 8
-    raise ValueError("lora_rank_style must be 'official' or 'simplified'")
 
 
 def rwkv7_param_breakdown(size: RWKV7Size) -> RWKV7ParamBreakdown:
@@ -113,27 +100,11 @@ def infer_size_from_checkpoint(
     head_size: int = 64,
 ) -> RWKV7Size:
     raw = torch.load(checkpoint, map_location="cpu")
-    if isinstance(raw, dict) and "model" in raw and isinstance(raw["model"], dict):
-        state = raw["model"]
-    elif isinstance(raw, dict) and "state_dict" in raw and isinstance(raw["state_dict"], dict):
-        state = raw["state_dict"]
-    elif isinstance(raw, dict):
-        state = raw
-    else:
-        raise TypeError("checkpoint must be a state_dict-like mapping")
-
-    vocab_size, n_embd = state["emb.weight"].shape
-    layer_ids = {
-        int(name.split(".")[1])
-        for name in state
-        if name.startswith("blocks.") and len(name.split(".")) > 2 and name.split(".")[1].isdigit()
-    }
-    if not layer_ids:
-        raise ValueError("checkpoint does not contain blocks.* tensors")
-    dim_ffn = state["blocks.0.ffn.key.weight"].shape[0]
+    state = _parse_checkpoint_state(raw)
+    vocab_size, n_embd, n_layer, dim_ffn = _infer_rwkv7_dims(state)
     return RWKV7Size(
         vocab_size=vocab_size,
-        n_layer=max(layer_ids) + 1,
+        n_layer=n_layer,
         n_embd=n_embd,
         dim_ffn=dim_ffn,
         head_size=head_size,

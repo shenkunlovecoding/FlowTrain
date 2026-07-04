@@ -91,6 +91,7 @@ def _warn_fallback(reason: str) -> None:
     warnings.warn(f"RWKV7 tilelang_block fallback: {reason}", RuntimeWarning, stacklevel=3)
 
 
+@lru_cache(maxsize=1)
 def _tilelang_gemm_ops():
     try:
         from .tilelang_gemm import tilelang_linear, tilelang_matmul
@@ -99,6 +100,7 @@ def _tilelang_gemm_ops():
     return tilelang_linear, tilelang_matmul
 
 
+@lru_cache(maxsize=1)
 def _tilelang_recurrence_ops():
     try:
         from .tilelang_recurrence import can_use_rwkv7_recurrence_tilelang, rwkv7_recurrence_tilelang
@@ -107,6 +109,7 @@ def _tilelang_recurrence_ops():
     return can_use_rwkv7_recurrence_tilelang, rwkv7_recurrence_tilelang
 
 
+@lru_cache(maxsize=1)
 def _rwkv7_recurrence_ref():
     try:
         from .rwkv7 import rwkv7_recurrence
@@ -169,7 +172,9 @@ def _time_mix_tilelang(att, x: torch.Tensor, v_first: torch.Tensor) -> tuple[tor
 
     x = att.ln_x(x.view(bsz * timesteps, channels)).view(bsz, timesteps, channels)
     x = x + (
-        (r.view(bsz, timesteps, h, -1) * k.view(bsz, timesteps, h, -1) * att.r_k).sum(dim=-1, keepdim=True)
+        (r.view(bsz, timesteps, h, -1).float() * k.view(bsz, timesteps, h, -1).float() * att.r_k)
+        .sum(dim=-1, keepdim=True)
+        .to(dtype=r.dtype)
         * v.view(bsz, timesteps, h, -1)
     ).view(bsz, timesteps, channels)
     return tilelang_linear(x * g, att.output.weight), v_first

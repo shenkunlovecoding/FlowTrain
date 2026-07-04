@@ -171,7 +171,6 @@ def _get_recurrence_backward_kernel(
             gout: T.Tensor((batch, timesteps, channels), T.bfloat16),
             s_ckpt: T.Tensor((batch, num_seg, n_head, n, n), T.float32),
             s_seg: T.Tensor((batch, n_head, chunk + 1, n, n), T.float32),
-            g_ws: T.Tensor((batch, n_head, n, n), T.float32),
             gr: T.Tensor((batch, timesteps, channels), T.bfloat16),
             gw: T.Tensor((batch, timesteps, channels), T.bfloat16),
             gk: T.Tensor((batch, timesteps, channels), T.bfloat16),
@@ -185,6 +184,7 @@ def _get_recurrence_backward_kernel(
                 mix_vec = T.alloc_fragment((n,), T.float32)
                 pvec = T.alloc_fragment((n,), T.float32)
                 gpvec = T.alloc_fragment((n,), T.float32)
+                g_ws = T.alloc_shared((n, n), T.float32)
 
                 # ---------------- Phase A: forward scan, dump boundary states ----------------
                 T.clear(state)
@@ -256,15 +256,15 @@ def _get_recurrence_backward_kernel(
                                     gout[pid_b, t, base + i], T.float32
                                 )
                             gr[pid_b, t, base + col] = T.cast(acc, T.bfloat16)
-                        # 2. G = H + gout (x) r. G is staged in GLOBAL memory (g_ws),
+                        # 2. G = H + gout (x) r.  G is staged in SHARED memory (g_ws),
                         # not a fragment: G is reduced along BOTH axes below (gw/gk/gb
                         # reduce over rows, gv/gpvec over cols), and a single fragment
-                        # layout cannot satisfy both -- at batch>=2 TileLang silently
-                        # picks a wrong layout. Global tensors tolerate mixed-axis reads
-                        # (s_seg already does). H stays a fragment, used only elementwise.
+                        # layout cannot satisfy both.  Shared memory tolerates mixed-axis
+                        # reads with ~20× lower latency than global memory.
+                        # H stays a fragment, used only elementwise.
                         for i, j in T.Parallel(n, n):
                             base = pid_h * n
-                            g_ws[pid_b, pid_h, i, j] = H[i, j] + T.cast(
+                            g_ws[i, j] = H[i, j] + T.cast(
                                 gout[pid_b, t, base + i], T.float32
                             ) * T.cast(r[pid_b, t, base + j], T.float32)
                         # 3. grad decay: gw[col] = sum_i G[i,col] * Spre[i,col]
@@ -272,7 +272,7 @@ def _get_recurrence_backward_kernel(
                             acc = T.alloc_var(T.float32)
                             acc = T.cast(0, T.float32)
                             for i in T.serial(n):
-                                acc += g_ws[pid_b, pid_h, i, col] * s_seg[pid_b, pid_h, inv, i, col]
+                                acc += g_ws[i, col] * s_seg[pid_b, pid_h, inv, i, col]
                             base = pid_h * n
                             gw[pid_b, t, base + col] = T.cast(acc, T.bfloat16)
                         # 4. grad v: gv[i] = sum_j G[i,j] * k[j]
@@ -281,7 +281,7 @@ def _get_recurrence_backward_kernel(
                             acc = T.alloc_var(T.float32)
                             acc = T.cast(0, T.float32)
                             for j in T.serial(n):
-                                acc += g_ws[pid_b, pid_h, row, j] * T.cast(k[pid_b, t, base + j], T.float32)
+                                acc += g_ws[row, j] * T.cast(k[pid_b, t, base + j], T.float32)
                             gv[pid_b, t, base + row] = T.cast(acc, T.bfloat16)
                         # 5. grad k: gk[col] = sum_i G[i,col] * v[i]
                         for col in T.Parallel(n):
@@ -289,7 +289,7 @@ def _get_recurrence_backward_kernel(
                             acc = T.alloc_var(T.float32)
                             acc = T.cast(0, T.float32)
                             for i in T.serial(n):
-                                acc += g_ws[pid_b, pid_h, i, col] * T.cast(v[pid_b, t, base + i], T.float32)
+                                acc += g_ws[i, col] * T.cast(v[pid_b, t, base + i], T.float32)
                             gk[pid_b, t, base + col] = T.cast(acc, T.bfloat16)
                         # 6. pvec = Spre @ a   (pvec[i] = sum_q Spre[i,q] * a[q])
                         for row in T.Parallel(n):
@@ -307,7 +307,7 @@ def _get_recurrence_backward_kernel(
                             acc = T.alloc_var(T.float32)
                             acc = T.cast(0, T.float32)
                             for i in T.serial(n):
-                                acc += g_ws[pid_b, pid_h, i, col] * pvec[i]
+                                acc += g_ws[i, col] * pvec[i]
                             gb[pid_b, t, base + col] = T.cast(acc, T.bfloat16)
                         # 8. gpvec = G @ b   (gpvec[i] = sum_j G[i,j] * b[j])
                         for row in T.Parallel(n):
@@ -315,7 +315,7 @@ def _get_recurrence_backward_kernel(
                             acc = T.alloc_var(T.float32)
                             acc = T.cast(0, T.float32)
                             for j in T.serial(n):
-                                acc += g_ws[pid_b, pid_h, row, j] * T.cast(b[pid_b, t, base + j], T.float32)
+                                acc += g_ws[row, j] * T.cast(b[pid_b, t, base + j], T.float32)
                             gpvec[row] = acc
                         # 9. grad a: ga[col] = sum_i Spre[i,col] * gpvec[i]
                         for col in T.Parallel(n):
@@ -328,7 +328,7 @@ def _get_recurrence_backward_kernel(
                         # 10. carry: H = G * decay + gpvec (x) a   (G in g_ws)
                         for i, j in T.Parallel(n, n):
                             base = pid_h * n
-                            H[i, j] = g_ws[pid_b, pid_h, i, j] * T.cast(
+                            H[i, j] = g_ws[i, j] * T.cast(
                                 decay[pid_b, t, base + j], T.float32
                             ) + gpvec[i] * T.cast(a[pid_b, t, base + j], T.float32)
 
@@ -386,7 +386,6 @@ def _fused_recurrence_backward(
     s_seg = torch.zeros(
         (batch, n_head, chunk + 1, head_size, head_size), device=r.device, dtype=torch.float32
     )
-    g_ws = torch.zeros((batch, n_head, head_size, head_size), device=r.device, dtype=torch.float32)
     gr = torch.zeros_like(r)
     gw = torch.zeros_like(r)
     gk = torch.zeros_like(k)
@@ -405,7 +404,6 @@ def _fused_recurrence_backward(
         gout.contiguous(),
         s_ckpt,
         s_seg,
-        g_ws,
         gr,
         gw,
         gk,

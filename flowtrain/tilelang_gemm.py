@@ -70,7 +70,6 @@ def can_use_tilelang_matmul(a: torch.Tensor, b: torch.Tensor) -> bool:
         and a.dim() == 2
         and b.dim() == 2
         and a.shape[1] == b.shape[0]
-        and _tile_config(a.shape[0], b.shape[1], a.shape[1]) is not None
     )
 
 
@@ -84,23 +83,51 @@ def _get_bf16_scalar_matmul_kernel(m: int, n: int, k: int, bm: int, bn: int, num
     return _build_bf16_scalar_matmul_kernel(m, n, k, bm, bn, num_warps)
 
 
+def _pad_to(tile: int, dim: int) -> int:
+    return ((dim + tile - 1) // tile) * tile
+
+
 def _tilelang_matmul_forward(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     m, k = a.shape
     k_b, n = b.shape
     if k_b != k:
         raise RuntimeError(f"matmul shape mismatch: {tuple(a.shape)} x {tuple(b.shape)}")
+
+    a_c = a.contiguous()
+    b_c = b.contiguous()
+
+    if k < 16:
+        # Scalar path is safe for any shape (has explicit bounds checks).
+        config = _tile_config(m, n, k)
+        if config is None:
+            return a @ b
+        bm, bn, _, num_warps = config
+        out = torch.empty((m, n), device=a.device, dtype=torch.bfloat16)
+        kernel = _get_bf16_scalar_matmul_kernel(m, n, k, bm, bn, num_warps)
+        kernel(a_c, b_c, out)
+        return out
+
+    # Tiled path: pad to multiples of tile sizes so the kernel never reads/writes
+    # out-of-bounds in the last tile row/column.
     config = _tile_config(m, n, k)
     if config is None:
         return a @ b
     bm, bn, bk, num_warps = config
-    a_c = a.contiguous()
-    b_c = b.contiguous()
-    out = torch.empty((m, n), device=a.device, dtype=torch.bfloat16)
-    if k < 16:
-        kernel = _get_bf16_scalar_matmul_kernel(m, n, k, bm, bn, num_warps)
-        kernel(a_c, b_c, out)
-        return out
+    m_pad = _pad_to(bm, m)
+    n_pad = _pad_to(bn, n)
+    k_pad = _pad_to(bk, k)
+
+    needs_pad = m_pad != m or n_pad != n or k_pad != k
+    if needs_pad:
+        a_c = torch.nn.functional.pad(a_c, (0, k_pad - k, 0, m_pad - m))
+        b_c = torch.nn.functional.pad(b_c, (0, n_pad - n, 0, k_pad - k))
+        out_pad = torch.empty((m_pad, n_pad), device=a.device, dtype=torch.bfloat16)
+        kernel = _get_bf16_matmul_kernel(m_pad, n_pad, k_pad, bm, bn, bk, num_warps)
+        kernel(a_c, b_c, out_pad)
+        return out_pad[:m, :n]
+
     kernel = _get_bf16_matmul_kernel(m, n, k, bm, bn, bk, num_warps)
+    out = torch.empty((m, n), device=a.device, dtype=torch.bfloat16)
     kernel(a_c, b_c, out)
     return out
 

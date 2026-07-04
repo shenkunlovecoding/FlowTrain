@@ -66,13 +66,13 @@ def _ortho_init(x: torch.Tensor, scale: float) -> torch.Tensor:
     return x
 
 
-def _official_rank(c: int, multiplier: float) -> int:
+def official_rank(c: int, multiplier: float) -> int:
     return max(32, int(round((multiplier * (c**0.5)) / 32) * 32))
 
 
-def _lora_ranks(c: int, style: str) -> tuple[int, int, int, int]:
+def lora_ranks(c: int, style: str) -> tuple[int, int, int, int]:
     if style == "official":
-        return _official_rank(c, 2.5), _official_rank(c, 2.5), _official_rank(c, 1.7), _official_rank(c, 5.0)
+        return official_rank(c, 2.5), official_rank(c, 2.5), official_rank(c, 1.7), official_rank(c, 5.0)
     if style == "simplified":
         return 8, 8, 8, 8
     raise ValueError(f"unknown lora_rank_style: {style}")
@@ -139,7 +139,7 @@ class RWKV7TimeMix(nn.Module):
             zigzag = zigzag * torch.abs(zigzag)
             www = -6 + 6 * (torch.arange(c, dtype=torch.float32) / (c - 1)) ** (1 + ratio_0_to_1**0.3)
 
-            d_decay, d_aaa, d_mv, d_gate = _lora_ranks(c, config.lora_rank_style)
+            d_decay, d_aaa, d_mv, d_gate = lora_ranks(c, config.lora_rank_style)
             self.w1 = nn.Parameter(torch.zeros(c, d_decay))
             self.w2 = nn.Parameter(_ortho_init(torch.zeros(d_decay, c), 0.1))
             self.w0 = nn.Parameter(www.reshape(1, 1, c) + 0.5 + zigzag * 2.5)
@@ -201,7 +201,7 @@ class RWKV7TimeMix(nn.Module):
 
         x = rwkv7_recurrence(r, w, k, v, -kk, kk * a, self.head_size)
         x = self.ln_x(x.view(bsz * timesteps, channels)).view(bsz, timesteps, channels)
-        x = x + ((r.view(bsz, timesteps, h, -1) * k.view(bsz, timesteps, h, -1) * self.r_k).sum(dim=-1, keepdim=True) * v.view(bsz, timesteps, h, -1)).view(bsz, timesteps, channels)
+        x = x + ((r.view(bsz, timesteps, h, -1).float() * k.view(bsz, timesteps, h, -1).float() * self.r_k).sum(dim=-1, keepdim=True).to(dtype=x.dtype) * v.view(bsz, timesteps, h, -1)).view(bsz, timesteps, channels)
         return self.output(x * g), v_first
 
 

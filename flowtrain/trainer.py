@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class FlowTrainConfig:
     device: int | str = 0
+    devices: list[int] | None = None  # multi-GPU: list of device IDs; overrides device
     dtype: torch.dtype = torch.bfloat16
     backend: Literal["tilelang", "torch_ref"] = "tilelang"
     chunk_len: int = 16
@@ -53,6 +54,16 @@ class FlowTrainConfig:
         if self.activation_strategy not in ("recompute", "store_layer_inputs"):
             raise ValueError("activation_strategy must be 'recompute' or 'store_layer_inputs'")
 
+        # Derive devices / world_size
+        if self.devices is not None:
+            if len(self.devices) == 0:
+                raise ValueError("devices list must not be empty")
+            self.world_size = len(self.devices)
+            self.device = self.devices[0]
+        else:
+            self.world_size = 1
+            self.devices = [self.device if isinstance(self.device, int) else 0]
+
 
 def _device(value: int | str) -> torch.device:
     if isinstance(value, int):
@@ -71,13 +82,19 @@ def _pin_empty(numel: int, dtype: torch.dtype) -> torch.Tensor:
         return torch.empty(numel, dtype=dtype, device="cpu")
 
 
-def infer_rwkv7_config_from_state(
-    state: dict[str, torch.Tensor],
-    *,
-    ctx_len: int,
-    backend: Literal["tilelang", "torch_ref"] = "tilelang",
-    chunk_len: int = 16,
-) -> RWKV7Config:
+def _parse_checkpoint_state(raw: dict) -> dict[str, torch.Tensor]:
+    """Extract the model state dict from a loaded checkpoint dictionary."""
+    if isinstance(raw, dict) and "model" in raw and isinstance(raw["model"], dict):
+        return raw["model"]
+    if isinstance(raw, dict) and "state_dict" in raw and isinstance(raw["state_dict"], dict):
+        return raw["state_dict"]
+    if isinstance(raw, dict):
+        return raw
+    raise TypeError("RWKV-7 checkpoint must be a state_dict-like mapping")
+
+
+def _infer_rwkv7_dims(state: dict[str, torch.Tensor]) -> tuple[int, int, int, int]:
+    """Extract (vocab_size, n_embd, n_layer, dim_ffn) from an RWKV-7 state dict."""
     vocab_size, n_embd = state["emb.weight"].shape
     layer_ids = {
         int(name.split(".")[1])
@@ -90,13 +107,24 @@ def infer_rwkv7_config_from_state(
     dim_ffn = state.get("blocks.0.ffn.key.weight")
     if dim_ffn is None:
         raise ValueError("checkpoint does not look like an RWKV-7 state_dict: missing blocks.0.ffn.key.weight")
+    return vocab_size, n_embd, n_layer, dim_ffn.shape[0]
+
+
+def infer_rwkv7_config_from_state(
+    state: dict[str, torch.Tensor],
+    *,
+    ctx_len: int,
+    backend: Literal["tilelang", "torch_ref"] = "tilelang",
+    chunk_len: int = 16,
+) -> RWKV7Config:
+    vocab_size, n_embd, n_layer, dim_ffn = _infer_rwkv7_dims(state)
     return RWKV7Config(
         vocab_size=vocab_size,
         n_layer=n_layer,
         n_embd=n_embd,
         ctx_len=ctx_len,
         head_size=64,
-        dim_ffn=dim_ffn.shape[0],
+        dim_ffn=dim_ffn,
         backend=backend,
         chunk_len=chunk_len,
     )
@@ -111,14 +139,7 @@ def load_rwkv7_checkpoint(
     chunk_len: int = 16,
 ) -> RWKV7:
     raw = torch.load(checkpoint, map_location="cpu")
-    if isinstance(raw, dict) and "model" in raw and isinstance(raw["model"], dict):
-        state = raw["model"]
-    elif isinstance(raw, dict) and "state_dict" in raw and isinstance(raw["state_dict"], dict):
-        state = raw["state_dict"]
-    elif isinstance(raw, dict):
-        state = raw
-    else:
-        raise TypeError("RWKV-7 checkpoint must be a state_dict-like mapping")
+    state = _parse_checkpoint_state(raw)
 
     rwkv_config = config or infer_rwkv7_config_from_state(
         state,
@@ -193,6 +214,8 @@ class FlowTrainTrainer:
         self._grad_tasks: list[
             tuple[torch.cuda.Event, torch.Tensor, list[torch.nn.Parameter], list[torch.Size], list[int], list[torch.Tensor]]
         ] = []
+        self._hidden_ready_event = torch.cuda.Event(enable_timing=False)
+        self._gpu_module_cache: dict[nn.Module, nn.Module] = {}
 
     def parameters(self):
         return self.model.parameters()
@@ -213,6 +236,7 @@ class FlowTrainTrainer:
         self.template_layer_idx = [{}, {}]
         self.template_busy_events = [{}, {}]
         self.template_ready_events = [{}, {}]
+        self._gpu_module_cache.clear()
         self.activation_store.clear()
         torch.cuda.empty_cache()
 
@@ -245,6 +269,7 @@ class FlowTrainTrainer:
             emb_gpu = self._clone_module_to_gpu(self.embedding)
             hidden = emb_gpu(input_ids_gpu)
             v_first = torch.empty_like(hidden)
+            self._hidden_ready_event.record(self.compute_stream)
 
         checkpoints = {}
         store_layer_inputs = self.config.activation_strategy == "store_layer_inputs"
@@ -255,7 +280,7 @@ class FlowTrainTrainer:
                 buffer_idx = layer_idx % 2
                 next_idx = layer_idx + 1
                 if store_layer_inputs or layer_idx % self.config.checkpoint_interval == 0:
-                    self.compute_stream.synchronize()
+                    self._hidden_ready_event.wait()
                     checkpoints[layer_idx] = self.activation_store.checkpoint(hidden, has_v_first=layer_idx > 0)
 
                 if next_idx < len(self.layers):
@@ -265,11 +290,11 @@ class FlowTrainTrainer:
                 with torch.cuda.stream(self.compute_stream):
                     hidden, v_first = gpu_layer(hidden, v_first)
                     self._record_buffer_busy(layer_idx, buffer_idx)
+                    self._hidden_ready_event.record(self.compute_stream)
                 if layer_idx == 0:
-                    self.compute_stream.synchronize()
                     self.activation_store.save_v_first(v_first)
 
-            self.compute_stream.synchronize()
+            self._hidden_ready_event.wait()
             checkpoints[len(self.layers)] = self.activation_store.checkpoint(hidden, has_v_first=bool(self.layers))
 
         fwd_end = time.perf_counter()
@@ -293,14 +318,13 @@ class FlowTrainTrainer:
                 del logits
             loss = total_loss / valid_tokens
             loss.backward()
-            loss_value_tensor = loss.detach().float()
 
         grad_hidden = hidden_before_norm.grad.detach()
         grad_v_first = torch.zeros_like(final_v_first)
         self._copy_module_grads_to_cpu_async(head_gpu, self.head)
         self._copy_module_grads_to_cpu_async(norm_gpu, self.norm)
 
-        loss_val = float(loss_value_tensor.cpu())
+        loss_val = loss.item()
         del hidden_after_norm, hidden_before_norm, final_hidden, final_v_first, total_loss
 
         if self.config.activation_strategy == "store_layer_inputs":
@@ -408,8 +432,14 @@ class FlowTrainTrainer:
         return next_grad_hidden, next_grad_v_first
 
     def _clone_module_to_gpu(self, module: nn.Module) -> nn.Module:
+        cached = self._gpu_module_cache.get(module)
+        if cached is not None:
+            for cpu_param, gpu_param in zip(module.parameters(), cached.parameters()):
+                gpu_param.data.copy_(cpu_param.detach().to(device=self.device, dtype=self.config.dtype))
+            return cached
         gpu_module = copy.deepcopy(module).to(device=self.device, dtype=self.config.dtype)
         gpu_module.train(module.training)
+        self._gpu_module_cache[module] = gpu_module
         return gpu_module
 
     def _refresh_layer_flat(self, layer_idx: int) -> None:
