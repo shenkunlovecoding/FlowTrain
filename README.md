@@ -76,8 +76,19 @@ regular-block templates for all later layers. Loading a layer overwrites only
 the template parameter slots, avoiding per-layer module construction during the
 streaming schedule.
 
-`make_optimizer` returns FlowTrain's CPU AdamW implementation. Parameters and
-optimizer state stay on CPU; updates use PyTorch CPU vector ops.
+`make_optimizer` returns FlowTrain's CPU AdamW implementation by default.
+Parameters and optimizer state stay on CPU; updates use PyTorch CPU vector ops.
+Pass `optimizer="qr_muon"` to enable the RWKV-specialized QR Muon adapter:
+`blocks.*` 2D matrices use streaming power-iteration Muon with shifted
+Cholesky QR, while embeddings, the output head, normalization weights, and
+vector/scalar parameters stay on AdamW.
+
+```bash
+python examples/rwkv7/train.py \
+  --backend torch_ref \
+  --optimizer qr_muon \
+  --muon-beta 0.95
+```
 
 ## Backends
 
@@ -86,6 +97,33 @@ optimizer state stay on CPU; updates use PyTorch CPU vector ops.
   `rwkv7_recurrence_tilelang(r, raw_w, k, v, a, b, head_size, chunk_len)`.
 - `backend="torch_ref"` is a correctness/debug path. It is not the default
   training backend.
+
+### Recurrence backward
+
+The recurrence forward has a custom TileLang kernel; its backward is now a
+fused TileLang kernel too, instead of recomputing through the pure-PyTorch
+reference. Given upstream grad `gout`, the kernel runs a checkpointed reverse
+adjoint scan:
+
+- Phase A re-runs the forward scan and dumps the pre-update state at every
+  `chunk` boundary (default chunk 64, chosen to divide the sequence length)
+  into a small workspace.
+- Phase B walks chunks in reverse: per chunk it sub-recomputes the segment
+  states from the boundary, then runs the adjoint step producing gradients for
+  `r, decay, k, v, a, b` while carrying the adjoint state `H` across chunks.
+
+Transient workspace is `O((T/chunk + chunk) * B * n_head * head_size^2 * 4)`
+bytes (fp32), freed after the step — checkpoint-recompute rather than storing
+all `T` forward states. `grad(decay)` is chained to `grad(raw_w)` in Python on
+the host. When the TileLang capability gate is not met (non-bf16, non-CUDA,
+`head_size != 64`, or `timesteps % chunk_len != 0`), the backward falls back to
+the PyTorch reference recompute path.
+
+Correctness is checked against finite differences in
+`tests/test_recurrence_backward.py`. Each case runs in a fresh subprocess
+because TileLang interns compiled kernels within a process, so compiling the
+recurrence for more than one shape in a single process returns the wrong
+binary; one shape per process (the normal training pattern) is unaffected.
 
 ## Activation Storage
 
@@ -106,6 +144,21 @@ The int8 path uses per-token symmetric quantization for checkpointed hidden
 states and the singleton `v_first`; tensors are dequantized back to bf16 during
 replay.
 
+`activation_strategy="store_layer_inputs"` stores every RWKV-7 layer input
+boundary instead of only every `checkpoint_interval` layers:
+
+```bash
+python examples/rwkv7/train.py \
+  --activation-offload cpu \
+  --activation-quant int8 \
+  --activation-strategy store_layer_inputs
+```
+
+This avoids cross-layer no-grad replay during backward. Each layer still runs
+one local replay with gradients so TimeMix/ChannelMix internals do not need to
+be stored. It is the middle ground between aggressive recompute and storing all
+block-internal activations.
+
 ## Measurement
 
 Estimate the largest batch size for the current single-GPU trainer:
@@ -114,7 +167,10 @@ Estimate the largest batch size for the current single-GPU trainer:
 python scripts/estimate_rwkv7_batch_size.py \
   --checkpoint rwkv7-g1d-0.1b-20260129-ctx8192.pth \
   --seq-len 8192 \
-  --activation-offload cpu
+  --optimizer qr_muon \
+  --activation-offload cpu \
+  --activation-quant int8 \
+  --activation-strategy store_layer_inputs
 ```
 
 Without a checkpoint, pass the model dimensions directly:
@@ -144,6 +200,7 @@ The script reports:
 - `tilelang`
 - `tilelang+singleton`
 - `tilelang+singleton+int8`
+- `tilelang+store_layer_inputs+int8`
 
 ## Static Checks
 

@@ -27,6 +27,7 @@ class FlowTrainConfig:
     num_grad_slabs: int = 12
     activation_offload: ActivationOffload = "cpu"
     activation_quant: ActivationQuant = "none"
+    activation_strategy: Literal["recompute", "store_layer_inputs"] = "recompute"
     max_grad_norm: float | None = 1.0
     logit_chunk_size: int = 128
 
@@ -49,6 +50,8 @@ class FlowTrainConfig:
             raise ValueError("activation_quant must be 'none' or 'int8'")
         if self.activation_quant == "int8" and self.activation_offload != "cpu":
             raise ValueError("activation_quant='int8' requires activation_offload='cpu'")
+        if self.activation_strategy not in ("recompute", "store_layer_inputs"):
+            raise ValueError("activation_strategy must be 'recompute' or 'store_layer_inputs'")
 
 
 def _device(value: int | str) -> torch.device:
@@ -244,13 +247,14 @@ class FlowTrainTrainer:
             v_first = torch.empty_like(hidden)
 
         checkpoints = {}
+        store_layer_inputs = self.config.activation_strategy == "store_layer_inputs"
         if self.layers:
             self._prefetch_layer_async(0, 0)
         with torch.no_grad():
             for layer_idx in range(len(self.layers)):
                 buffer_idx = layer_idx % 2
                 next_idx = layer_idx + 1
-                if layer_idx % self.config.checkpoint_interval == 0:
+                if store_layer_inputs or layer_idx % self.config.checkpoint_interval == 0:
                     self.compute_stream.synchronize()
                     checkpoints[layer_idx] = self.activation_store.checkpoint(hidden, has_v_first=layer_idx > 0)
 
@@ -299,63 +303,54 @@ class FlowTrainTrainer:
         loss_val = float(loss_value_tensor.cpu())
         del hidden_after_norm, hidden_before_norm, final_hidden, final_v_first, total_loss
 
-        num_blocks = (len(self.layers) + self.config.checkpoint_interval - 1) // self.config.checkpoint_interval
-        for block_idx in range(num_blocks - 1, -1, -1):
-            block_start = block_idx * self.config.checkpoint_interval
-            block_end = min((block_idx + 1) * self.config.checkpoint_interval, len(self.layers))
-            checkpoint_hidden, checkpoint_v_first = self.activation_store.unpack(checkpoints[block_start], self.device)
+        if self.config.activation_strategy == "store_layer_inputs":
+            for layer_idx in range(len(self.layers) - 1, -1, -1):
+                layer_input_base, state_input_base = self.activation_store.unpack(checkpoints[layer_idx], self.device)
+                grad_hidden, grad_v_first = self._replay_one_layer_backward(
+                    layer_idx,
+                    layer_input_base,
+                    state_input_base,
+                    grad_hidden,
+                    grad_v_first,
+                )
+        else:
+            num_blocks = (len(self.layers) + self.config.checkpoint_interval - 1) // self.config.checkpoint_interval
+            for block_idx in range(num_blocks - 1, -1, -1):
+                block_start = block_idx * self.config.checkpoint_interval
+                block_end = min((block_idx + 1) * self.config.checkpoint_interval, len(self.layers))
+                checkpoint_hidden, checkpoint_v_first = self.activation_store.unpack(checkpoints[block_start], self.device)
 
-            recompute_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-            hidden_recompute = checkpoint_hidden
-            v_first_recompute = checkpoint_v_first
-            if block_start < block_end:
-                self._prefetch_layer_async(block_start, block_start % 2)
-            with torch.no_grad():
-                for layer_idx in range(block_start, block_end):
-                    next_idx = layer_idx + 1
-                    if next_idx < block_end:
-                        self._prefetch_layer_async(next_idx, next_idx % 2)
-                    gpu_layer = self._wait_for_layer(layer_idx, layer_idx % 2)
-                    with torch.cuda.stream(self.compute_stream):
-                        hidden_recompute, v_first_recompute = gpu_layer(hidden_recompute, v_first_recompute)
-                        self._record_buffer_busy(layer_idx, layer_idx % 2)
-                    recompute_cache[layer_idx] = (hidden_recompute.detach(), v_first_recompute.detach())
+                recompute_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+                hidden_recompute = checkpoint_hidden
+                v_first_recompute = checkpoint_v_first
+                if block_start < block_end:
+                    self._prefetch_layer_async(block_start, block_start % 2)
+                with torch.no_grad():
+                    for layer_idx in range(block_start, block_end):
+                        next_idx = layer_idx + 1
+                        if next_idx < block_end:
+                            self._prefetch_layer_async(next_idx, next_idx % 2)
+                        gpu_layer = self._wait_for_layer(layer_idx, layer_idx % 2)
+                        with torch.cuda.stream(self.compute_stream):
+                            hidden_recompute, v_first_recompute = gpu_layer(hidden_recompute, v_first_recompute)
+                            self._record_buffer_busy(layer_idx, layer_idx % 2)
+                        recompute_cache[layer_idx] = (hidden_recompute.detach(), v_first_recompute.detach())
 
-            for layer_idx in range(block_end - 1, block_start - 1, -1):
-                if layer_idx == block_start:
-                    layer_input_base = checkpoint_hidden
-                    state_input_base = checkpoint_v_first
-                else:
-                    layer_input_base, state_input_base = recompute_cache[layer_idx - 1]
-
-                self._prefetch_layer_async(layer_idx, layer_idx % 2)
-                gpu_layer = self._wait_for_layer(layer_idx, layer_idx % 2)
-                with torch.cuda.stream(self.compute_stream):
-                    layer_input = layer_input_base.detach().requires_grad_(True)
-                    state_input = state_input_base.detach().requires_grad_(True)
-                    for param in gpu_layer.parameters():
-                        param.requires_grad_(True)
-
-                    layer_output, state_output = gpu_layer(layer_input, state_input)
-                    grad_targets = (layer_input, state_input, *tuple(gpu_layer.parameters()))
-                    grads = torch.autograd.grad(
-                        (layer_output, state_output),
-                        grad_targets,
-                        (grad_hidden, grad_v_first),
-                        retain_graph=False,
-                        create_graph=False,
-                        allow_unused=True,
+                for layer_idx in range(block_end - 1, block_start - 1, -1):
+                    if layer_idx == block_start:
+                        layer_input_base = checkpoint_hidden
+                        state_input_base = checkpoint_v_first
+                    else:
+                        layer_input_base, state_input_base = recompute_cache[layer_idx - 1]
+                    grad_hidden, grad_v_first = self._replay_one_layer_backward(
+                        layer_idx,
+                        layer_input_base,
+                        state_input_base,
+                        grad_hidden,
+                        grad_v_first,
                     )
-                    grad_hidden = grads[0].detach()
-                    grad_v_first = grads[1].detach() if grads[1] is not None else torch.zeros_like(state_input)
-                    for param, grad in zip(gpu_layer.parameters(), grads[2:], strict=True):
-                        param.grad = grad
-                        param.requires_grad_(False)
-                    self._record_buffer_busy(layer_idx, layer_idx % 2)
-                self._copy_layer_grads_to_cpu_async(layer_idx, gpu_layer)
-                self._drain_grad_tasks(wait_all=False)
 
-            recompute_cache.clear()
+                recompute_cache.clear()
 
         with torch.cuda.stream(self.compute_stream):
             emb_replay = self._clone_module_to_gpu(self.embedding)
@@ -375,6 +370,42 @@ class FlowTrainTrainer:
             "total": bwd_end - start,
             "activation_bytes_per_sample": self.activation_store.offloaded_bytes / max(1, input_ids.shape[0]),
         }
+
+    def _replay_one_layer_backward(
+        self,
+        layer_idx: int,
+        layer_input_base: torch.Tensor,
+        state_input_base: torch.Tensor,
+        grad_hidden: torch.Tensor,
+        grad_v_first: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self._prefetch_layer_async(layer_idx, layer_idx % 2)
+        gpu_layer = self._wait_for_layer(layer_idx, layer_idx % 2)
+        with torch.cuda.stream(self.compute_stream):
+            layer_input = layer_input_base.detach().requires_grad_(True)
+            state_input = state_input_base.detach().requires_grad_(True)
+            for param in gpu_layer.parameters():
+                param.requires_grad_(True)
+
+            layer_output, state_output = gpu_layer(layer_input, state_input)
+            grad_targets = (layer_input, state_input, *tuple(gpu_layer.parameters()))
+            grads = torch.autograd.grad(
+                (layer_output, state_output),
+                grad_targets,
+                (grad_hidden, grad_v_first),
+                retain_graph=False,
+                create_graph=False,
+                allow_unused=True,
+            )
+            next_grad_hidden = grads[0].detach()
+            next_grad_v_first = grads[1].detach() if grads[1] is not None else torch.zeros_like(state_input)
+            for param, grad in zip(gpu_layer.parameters(), grads[2:], strict=True):
+                param.grad = grad
+                param.requires_grad_(False)
+            self._record_buffer_busy(layer_idx, layer_idx % 2)
+        self._copy_layer_grads_to_cpu_async(layer_idx, gpu_layer)
+        self._drain_grad_tasks(wait_all=False)
+        return next_grad_hidden, next_grad_v_first
 
     def _clone_module_to_gpu(self, module: nn.Module) -> nn.Module:
         gpu_module = copy.deepcopy(module).to(device=self.device, dtype=self.config.dtype)

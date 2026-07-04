@@ -353,10 +353,70 @@ class RWKV7(nn.Module):
         return out
 
 
-def make_optimizer(model: RWKV7, lr: float = 6e-4, weight_decay: float = 0.1, betas: tuple[float, float] = (0.9, 0.99), eps: float = 1e-18):
-    from .optimizer import CPUAdamW
+def _use_qr_muon_parameter(name: str, param: torch.nn.Parameter) -> bool:
+    return (
+        name.startswith("blocks.")
+        and param.ndim == 2
+        and min(param.shape) >= 2
+        and not name.endswith("att.r_k")
+    )
+
+
+def _split_qr_muon_groups(groups: list[dict]) -> list[dict]:
+    split_groups: list[dict] = []
+    for group in groups:
+        names = group.get("names")
+        if names is None:
+            base = dict(group)
+            base.pop("names", None)
+            base["use_muon"] = False
+            split_groups.append(base)
+            continue
+
+        muon_params = []
+        adamw_params = []
+        for name, param in zip(names, group["params"], strict=True):
+            if _use_qr_muon_parameter(name, param):
+                muon_params.append(param)
+            else:
+                adamw_params.append(param)
+
+        base = {key: value for key, value in group.items() if key not in {"params", "names"}}
+        if adamw_params:
+            split_groups.append({**base, "params": adamw_params, "use_muon": False})
+        if muon_params:
+            split_groups.append({**base, "params": muon_params, "use_muon": True})
+    return split_groups
+
+
+def make_optimizer(
+    model: RWKV7,
+    lr: float = 6e-4,
+    weight_decay: float = 0.1,
+    betas: tuple[float, float] = (0.9, 0.99),
+    eps: float = 1e-18,
+    optimizer: Literal["adamw", "qr_muon"] = "adamw",
+    muon_beta: float = 0.95,
+    muon_eps: float = 1e-9,
+    muon_double_qr: bool = True,
+):
+    from .optimizer import CPUAdamW, CPUQRMuon
 
     groups = model.optimizer_groups(weight_decay=weight_decay)
+    if optimizer == "qr_muon":
+        return CPUQRMuon(
+            _split_qr_muon_groups(groups),
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            muon_beta=muon_beta,
+            muon_eps=muon_eps,
+            muon_double_qr=muon_double_qr,
+        )
+    if optimizer != "adamw":
+        raise ValueError("optimizer must be 'adamw' or 'qr_muon'")
+
     for group in groups:
         group.pop("names", None)
     return CPUAdamW(groups, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)

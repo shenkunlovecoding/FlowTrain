@@ -11,6 +11,8 @@ import torch
 
 ActivationOffload = Literal["none", "cpu"]
 ActivationQuant = Literal["none", "int8"]
+ActivationStrategy = Literal["recompute", "store_layer_inputs"]
+OptimizerKind = Literal["adamw", "qr_muon"]
 
 
 @dataclass(frozen=True)
@@ -92,6 +94,18 @@ def rwkv7_param_breakdown(size: RWKV7Size) -> RWKV7ParamBreakdown:
     )
 
 
+def _qr_muon_param_and_basis_entries(size: RWKV7Size) -> tuple[int, int]:
+    c = size.n_embd
+    ffn = size.dim_ffn
+    ranks = lora_ranks(c, size.lora_rank_style)
+    rank_sum = sum(ranks)
+    rank_sq_sum = sum(rank * rank for rank in ranks)
+
+    muon_params_per_layer = 4 * c * c + 2 * c * rank_sum + 2 * c * ffn
+    basis_entries_per_layer = 4 * c * c + 2 * rank_sq_sum + 2 * min(c, ffn) ** 2
+    return size.n_layer * muon_params_per_layer, size.n_layer * basis_entries_per_layer
+
+
 def infer_size_from_checkpoint(
     checkpoint: str | Path,
     *,
@@ -152,6 +166,7 @@ def estimate_rwkv7_batch_size(
     cpu_gb: float | None = None,
     activation_offload: ActivationOffload = "cpu",
     activation_quant: ActivationQuant = "none",
+    activation_strategy: ActivationStrategy = "recompute",
     checkpoint_interval: int = 4,
     gpu_utilization: float = 0.90,
     cpu_utilization: float = 0.85,
@@ -159,6 +174,7 @@ def estimate_rwkv7_batch_size(
     reserve_cpu_gb: float = 8.0,
     param_dtype_bytes: int = 4,
     gpu_dtype_bytes: int = 2,
+    optimizer: OptimizerKind = "adamw",
     optimizer_state_bytes_per_param: int = 8,
     logit_chunk_size: int = 128,
     hidden_gpu_copies: int = 10,
@@ -173,6 +189,10 @@ def estimate_rwkv7_batch_size(
         raise ValueError("activation_quant must be 'none' or 'int8'")
     if activation_quant == "int8" and activation_offload != "cpu":
         raise ValueError("activation_quant='int8' requires activation_offload='cpu'")
+    if activation_strategy not in ("recompute", "store_layer_inputs"):
+        raise ValueError("activation_strategy must be 'recompute' or 'store_layer_inputs'")
+    if optimizer not in ("adamw", "qr_muon"):
+        raise ValueError("optimizer must be 'adamw' or 'qr_muon'")
 
     breakdown = rwkv7_param_breakdown(size)
     max_layer = max(breakdown.first_layer_params, breakdown.regular_layer_params)
@@ -191,7 +211,10 @@ def estimate_rwkv7_batch_size(
     gpu_per_sample_bytes = hidden_gpu_copies * token_hidden_bytes + logit_bytes + token_id_bytes
 
     if activation_offload == "cpu":
-        n_checkpoints = math.ceil(size.n_layer / checkpoint_interval) + 1
+        if activation_strategy == "store_layer_inputs":
+            n_checkpoints = size.n_layer + 1
+        else:
+            n_checkpoints = math.ceil(size.n_layer / checkpoint_interval) + 1
         if activation_quant == "int8":
             packed_tensor_bytes = seq_len * (size.n_embd + 2)
         else:
@@ -199,11 +222,28 @@ def estimate_rwkv7_batch_size(
         cpu_activation_per_sample_bytes = (n_checkpoints + 1) * packed_tensor_bytes
     else:
         cpu_activation_per_sample_bytes = 0
-        n_checkpoints = math.ceil(size.n_layer / checkpoint_interval) + 1
+        if activation_strategy == "store_layer_inputs":
+            n_checkpoints = size.n_layer + 1
+        else:
+            n_checkpoints = math.ceil(size.n_layer / checkpoint_interval) + 1
         gpu_per_sample_bytes += (n_checkpoints + 1) * token_hidden_bytes
 
+    if optimizer == "qr_muon":
+        muon_params, muon_basis_entries = _qr_muon_param_and_basis_entries(size)
+        adamw_params = max(0, breakdown.total_params - muon_params)
+        optimizer_state_bytes = (
+            adamw_params * optimizer_state_bytes_per_param
+            + muon_params * param_dtype_bytes
+            + muon_basis_entries * param_dtype_bytes
+        )
+        optimizer_assumption = "QR Muon states are used for RWKV block projection/LoRA matrices; other params use AdamW"
+    else:
+        optimizer_state_bytes = breakdown.total_params * optimizer_state_bytes_per_param
+        optimizer_assumption = "CPU params, CPU grads, and AdamW states stay on host memory"
+
     cpu_base_bytes = (
-        breakdown.total_params * (param_dtype_bytes + param_dtype_bytes + optimizer_state_bytes_per_param)
+        breakdown.total_params * (param_dtype_bytes + param_dtype_bytes)
+        + optimizer_state_bytes
         + (breakdown.first_layer_params + max(0, size.n_layer - 1) * breakdown.regular_layer_params) * gpu_dtype_bytes
     )
 
@@ -225,9 +265,9 @@ def estimate_rwkv7_batch_size(
 
     assumptions = (
         "single CUDA GPU, bf16 GPU weights and activations",
-        "CPU params, CPU grads, and AdamW states stay on host memory",
+        optimizer_assumption,
         "current trainer computes next-token logits in chunks; pass logit_chunk_size=0 to model full-sequence logits",
-        f"activation checkpoint count is ceil(n_layer / checkpoint_interval) + 1 = {n_checkpoints}",
+        f"activation checkpoint count is {n_checkpoints}",
         f"hidden_gpu_copies={hidden_gpu_copies} is a conservative peak multiplier",
     )
     return BatchSizeEstimate(

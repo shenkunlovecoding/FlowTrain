@@ -46,6 +46,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-steps", type=int, default=3)
     parser.add_argument("--lr", type=float, default=4e-3)
     parser.add_argument("--weight-decay", type=float, default=0.1)
+    parser.add_argument("--optimizer", choices=("adamw", "qr_muon"), default="adamw")
+    parser.add_argument("--muon-beta", type=float, default=0.95)
+    parser.add_argument("--muon-eps", type=float, default=1e-9)
     parser.add_argument("--checkpoint-interval", type=int, default=1)
     parser.add_argument("--num-grad-slabs", type=int, default=4)
     parser.add_argument("--device", type=int, default=0)
@@ -54,6 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chunk-len", type=int, default=16)
     parser.add_argument("--activation-offload", choices=("none", "cpu"), default="cpu")
     parser.add_argument("--activation-quant", choices=("none", "int8"), default="none")
+    parser.add_argument("--activation-strategy", choices=("recompute", "store_layer_inputs"), default="recompute")
     parser.add_argument("--logit-chunk-size", type=int, default=128)
     return parser.parse_args()
 
@@ -85,22 +89,34 @@ def main() -> None:
             num_grad_slabs=args.num_grad_slabs,
             activation_offload=args.activation_offload,
             activation_quant=args.activation_quant,
+            activation_strategy=args.activation_strategy,
             logit_chunk_size=args.logit_chunk_size,
         ),
     )
     del model
 
-    optimizer = make_optimizer(trainer.model, lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.99), eps=1e-18)
+    optimizer = make_optimizer(
+        trainer.model,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        betas=(0.9, 0.99),
+        eps=1e-18,
+        optimizer=args.optimizer,
+        muon_beta=args.muon_beta,
+        muon_eps=args.muon_eps,
+    )
 
     logger.info(
-        "FlowTrain RWKV7: layers=%d emb=%d backend=%s chunk=%d logits=%d activation=%s/%s",
+        "FlowTrain RWKV7: layers=%d emb=%d backend=%s optimizer=%s chunk=%d logits=%d activation=%s/%s/%s",
         args.n_layer,
         args.n_embd,
         args.backend,
+        args.optimizer,
         args.chunk_len,
         args.logit_chunk_size,
         args.activation_offload,
         args.activation_quant,
+        args.activation_strategy,
     )
 
     for step in range(args.num_steps):

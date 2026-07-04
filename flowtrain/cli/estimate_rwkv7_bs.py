@@ -25,6 +25,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-interval", type=int, default=4)
     parser.add_argument("--activation-offload", choices=("none", "cpu"), default="cpu")
     parser.add_argument("--activation-quant", choices=("none", "int8"), default="none")
+    parser.add_argument("--activation-strategy", choices=("recompute", "store_layer_inputs"), default="recompute")
+    parser.add_argument("--optimizer", choices=("adamw", "qr_muon"), default="adamw")
     parser.add_argument("--gpu-gb", type=float, default=None)
     parser.add_argument("--cpu-gb", type=float, default=None)
     parser.add_argument("--device", type=int, default=0)
@@ -78,11 +80,13 @@ def main() -> None:
         cpu_gb=cpu_gb,
         activation_offload=args.activation_offload,
         activation_quant=args.activation_quant,
+        activation_strategy=args.activation_strategy,
         checkpoint_interval=args.checkpoint_interval,
         gpu_utilization=args.gpu_utilization,
         cpu_utilization=args.cpu_utilization,
         reserve_gpu_gb=args.reserve_gpu_gb,
         reserve_cpu_gb=args.reserve_cpu_gb,
+        optimizer=args.optimizer,
         logit_chunk_size=args.logit_chunk_size,
         hidden_gpu_copies=args.hidden_gpu_copies,
     )
@@ -95,7 +99,8 @@ def main() -> None:
     print(f"gpu_memory: {gpu_gb:.2f} GB")
     if cpu_gb is not None:
         print(f"cpu_memory: {cpu_gb:.2f} GB")
-    print(f"activation: offload={args.activation_offload} quant={args.activation_quant}")
+    print(f"optimizer: {args.optimizer}")
+    print(f"activation: offload={args.activation_offload} quant={args.activation_quant} strategy={args.activation_strategy}")
     print(f"logit_chunk_size: {args.logit_chunk_size if args.logit_chunk_size > 0 else 'full_sequence'}")
     print()
     print(f"estimated_max_batch_size: {estimate.max_batch_size}")

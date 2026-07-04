@@ -74,6 +74,7 @@ def measure_flowtrain(
     seq_len: int,
     device_id: int,
     activation_quant: str,
+    activation_strategy: str = "recompute",
 ) -> tuple[float, float]:
     trainer = FlowTrainTrainer(
         model,
@@ -84,6 +85,7 @@ def measure_flowtrain(
             checkpoint_interval=1,
             activation_offload="cpu",
             activation_quant=activation_quant,
+            activation_strategy=activation_strategy,
         ),
     )
     input_ids = torch.randint(0, model.config.vocab_size, (batch_size, seq_len), device="cpu")
@@ -113,6 +115,16 @@ def main() -> None:
         int8_model = make_model(args, "tilelang")
         rows.append(("tilelang+singleton+int8", batch_size, *measure_flowtrain(int8_model, batch_size, args.seq_len, args.device, "int8")))
         del int8_model
+
+        stored_model = make_model(args, "tilelang")
+        rows.append(
+            (
+                "tilelang+store_layer_inputs+int8",
+                batch_size,
+                *measure_flowtrain(stored_model, batch_size, args.seq_len, args.device, "int8", "store_layer_inputs"),
+            )
+        )
+        del stored_model
 
     print("mode,batch_size,gb_per_sample,seconds")
     for mode, batch_size, gb_per_sample, seconds in rows:
