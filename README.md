@@ -53,6 +53,32 @@ The source-tree equivalent is:
 python examples/rwkv7/train.py --backend tilelang
 ```
 
+## Optimization Model
+
+FlowTrain uses the original three-stage streaming schedule adapted to RWKV-7:
+
+- Streaming forward loads one RWKV-7 block at a time from CPU master weights and
+  keeps only checkpointed hidden states.
+- Loss is computed with chunked vocabulary projection, then head and norm
+  gradients are scheduled back to CPU.
+- Replay backward reloads each checkpoint block, recomputes its activations, and
+  schedules block gradients back to CPU as soon as they are produced.
+
+The trainer maintains separate CUDA streams for compute, weight H2D prefetch,
+and gradient D2H transfer. Two GPU layer buffers are alternated so the weight
+stream can prefetch the next block while the compute stream runs the current
+block. CPU gradients are staged through pinned slabs capped by
+`num_grad_slabs`.
+
+RWKV-7 layer execution uses stateless GPU templates specialized by block kind:
+one template for layer 0, which owns `ln0` and creates `v_first`, and reusable
+regular-block templates for all later layers. Loading a layer overwrites only
+the template parameter slots, avoiding per-layer module construction during the
+streaming schedule.
+
+`make_optimizer` returns FlowTrain's CPU AdamW implementation. Parameters and
+optimizer state stay on CPU; updates use PyTorch CPU vector ops.
+
 ## Backends
 
 - `backend="tilelang"` is the default training path. TimeMix and ChannelMix use
@@ -81,6 +107,29 @@ states and the singleton `v_first`; tensors are dequantized back to bf16 during
 replay.
 
 ## Measurement
+
+Estimate the largest batch size for the current single-GPU trainer:
+
+```bash
+python scripts/estimate_rwkv7_batch_size.py \
+  --checkpoint rwkv7-g1d-0.1b-20260129-ctx8192.pth \
+  --seq-len 8192 \
+  --activation-offload cpu
+```
+
+Without a checkpoint, pass the model dimensions directly:
+
+```bash
+flowtrain-estimate-rwkv7-bs \
+  --n-layer 24 \
+  --n-embd 2048 \
+  --vocab-size 65536 \
+  --seq-len 4096 \
+  --gpu-gb 16
+```
+
+The estimator models the current trainer, including chunked logits by default.
+Pass `--logit-chunk-size 0` only when comparing against full-sequence logits.
 
 ```bash
 python scripts/measure_rwkv7_activation.py \

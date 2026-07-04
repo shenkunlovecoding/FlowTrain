@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import torch
 
-from flowtrain import FlowTrainConfig, RWKV7, RWKV7ActivationStore, RWKV7Config, make_optimizer
+from flowtrain import CPUAdamW, FlowTrainConfig, RWKV7, RWKV7ActivationStore, RWKV7Config, make_optimizer
+from flowtrain.estimator import RWKV7Size, estimate_rwkv7_batch_size, rwkv7_param_breakdown
 
 
 def test_public_rwkv7_torch_ref_forward_backward():
@@ -25,7 +26,7 @@ def test_public_rwkv7_torch_ref_forward_backward():
     assert sum(param.grad is not None for param in model.parameters()) > 0
 
 
-def test_make_optimizer_returns_adamw():
+def test_make_optimizer_returns_cpu_adamw():
     model = RWKV7(
         RWKV7Config(
             vocab_size=12,
@@ -37,7 +38,12 @@ def test_make_optimizer_returns_adamw():
         )
     )
     optimizer = make_optimizer(model)
-    assert isinstance(optimizer, torch.optim.AdamW)
+    assert isinstance(optimizer, CPUAdamW)
+    before = model.head.weight.detach().clone()
+    loss = model(torch.randint(0, 12, (1, 4))).float().mean()
+    loss.backward()
+    optimizer.step()
+    assert not torch.equal(before, model.head.weight.detach())
 
 
 def test_flowtrain_config_rejects_int8_without_cpu_offload():
@@ -62,9 +68,19 @@ def test_activation_store_int8_roundtrip_cpu():
     assert v_first_out.dtype == torch.bfloat16
 
 
+def test_estimator_reports_positive_batch_for_tiny_model():
+    size = RWKV7Size(vocab_size=12, n_layer=2, n_embd=64, dim_ffn=224, lora_rank_style="simplified")
+    breakdown = rwkv7_param_breakdown(size)
+    estimate = estimate_rwkv7_batch_size(size, seq_len=32, gpu_gb=8, cpu_gb=32)
+    assert breakdown.total_params > 0
+    assert estimate.max_batch_size > 0
+    assert estimate.gpu_per_sample_gb > 0
+
+
 if __name__ == "__main__":
     test_public_rwkv7_torch_ref_forward_backward()
-    test_make_optimizer_returns_adamw()
+    test_make_optimizer_returns_cpu_adamw()
     test_flowtrain_config_rejects_int8_without_cpu_offload()
     test_activation_store_int8_roundtrip_cpu()
+    test_estimator_reports_positive_batch_for_tiny_model()
     print("smoke ok")

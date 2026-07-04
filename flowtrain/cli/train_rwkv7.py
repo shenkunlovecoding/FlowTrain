@@ -6,7 +6,7 @@ import random
 
 import torch
 
-from flowtrain import FlowTrainConfig, FlowTrainTrainer, RWKV7, RWKV7Config
+from flowtrain import FlowTrainConfig, FlowTrainTrainer, RWKV7, RWKV7Config, make_optimizer
 
 TOK = {**{str(i): i for i in range(10)}, ",": 10, "#": 11}
 DIGIT_MAX = 20
@@ -54,18 +54,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chunk-len", type=int, default=16)
     parser.add_argument("--activation-offload", choices=("none", "cpu"), default="cpu")
     parser.add_argument("--activation-quant", choices=("none", "int8"), default="none")
+    parser.add_argument("--logit-chunk-size", type=int, default=128)
     return parser.parse_args()
-
-
-def _apply_lr_scale(groups: list[dict], base_lr: float) -> list[dict]:
-    scaled = []
-    for group in groups:
-        group = dict(group)
-        group.pop("names", None)
-        scale = group.pop("my_lr_scale", 1.0)
-        group["lr"] = base_lr * scale
-        scaled.append(group)
-    return scaled
 
 
 def main() -> None:
@@ -95,22 +85,20 @@ def main() -> None:
             num_grad_slabs=args.num_grad_slabs,
             activation_offload=args.activation_offload,
             activation_quant=args.activation_quant,
+            logit_chunk_size=args.logit_chunk_size,
         ),
     )
     del model
 
-    optimizer = torch.optim.AdamW(
-        _apply_lr_scale(trainer.optimizer_groups(args.weight_decay), args.lr),
-        betas=(0.9, 0.99),
-        eps=1e-18,
-    )
+    optimizer = make_optimizer(trainer.model, lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.99), eps=1e-18)
 
     logger.info(
-        "FlowTrain RWKV7: layers=%d emb=%d backend=%s chunk=%d activation=%s/%s",
+        "FlowTrain RWKV7: layers=%d emb=%d backend=%s chunk=%d logits=%d activation=%s/%s",
         args.n_layer,
         args.n_embd,
         args.backend,
         args.chunk_len,
+        args.logit_chunk_size,
         args.activation_offload,
         args.activation_quant,
     )

@@ -353,11 +353,13 @@ class RWKV7(nn.Module):
         return out
 
 
-def make_optimizer(model: RWKV7, lr: float = 6e-4, weight_decay: float = 0.1, betas: tuple[float, float] = (0.9, 0.99), eps: float = 1e-18) -> torch.optim.AdamW:
+def make_optimizer(model: RWKV7, lr: float = 6e-4, weight_decay: float = 0.1, betas: tuple[float, float] = (0.9, 0.99), eps: float = 1e-18):
+    from .optimizer import CPUAdamW
+
     groups = model.optimizer_groups(weight_decay=weight_decay)
     for group in groups:
         group.pop("names", None)
-    return torch.optim.AdamW(groups, lr=lr, betas=betas, eps=eps)
+    return CPUAdamW(groups, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
 
 
 def count_parameters(parameters: Iterable[torch.nn.Parameter]) -> int:

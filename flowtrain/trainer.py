@@ -28,6 +28,7 @@ class FlowTrainConfig:
     activation_offload: ActivationOffload = "cpu"
     activation_quant: ActivationQuant = "none"
     max_grad_norm: float | None = 1.0
+    logit_chunk_size: int = 128
 
     def __post_init__(self) -> None:
         if self.backend not in ("tilelang", "torch_ref"):
@@ -38,6 +39,10 @@ class FlowTrainConfig:
             raise ValueError("checkpoint_interval must be >= 1")
         if self.chunk_len < 1:
             raise ValueError("chunk_len must be >= 1")
+        if self.num_grad_slabs < 1:
+            raise ValueError("num_grad_slabs must be >= 1")
+        if self.logit_chunk_size < 1:
+            raise ValueError("logit_chunk_size must be >= 1")
         if self.activation_offload not in ("none", "cpu"):
             raise ValueError("activation_offload must be 'none' or 'cpu'")
         if self.activation_quant not in ("none", "int8"):
@@ -124,7 +129,7 @@ def load_rwkv7_checkpoint(
 
 
 class FlowTrainTrainer:
-    """RWKV-7-only CPU-master trainer with explicit replay backward."""
+    """RWKV-7-only CPU-master trainer with streamed replay backward."""
 
     def __init__(
         self,
@@ -138,6 +143,7 @@ class FlowTrainTrainer:
         self.device = _device(config.device)
         if self.device.type != "cuda":
             raise ValueError("FlowTrain v1 requires a CUDA device")
+        torch.cuda.set_device(self.device)
 
         if isinstance(model_or_checkpoint, RWKV7):
             model = model_or_checkpoint
@@ -163,13 +169,27 @@ class FlowTrainTrainer:
         self.head = self.model.head
         self.vocab_size = self.model.config.vocab_size
 
+        self.compute_stream = torch.cuda.Stream(device=self.device)
+        self.weight_stream = torch.cuda.Stream(device=self.device)
+        self.grad_stream = torch.cuda.Stream(device=self.device)
         self.activation_store = RWKV7ActivationStore(config.activation_offload, config.activation_quant)
-        self.gpu_layer_buffers: list[nn.Module | None] = [None, None]
-        self.gpu_layer_kinds: list[str | None] = [None, None]
+        self.gpu_layer_templates: list[dict[str, nn.Module]] = [{}, {}]
+        self.template_layer_idx: list[dict[str, int | None]] = [{}, {}]
+        self.template_busy_events: list[dict[str, torch.cuda.Event | None]] = [{}, {}]
+        self.template_ready_events: list[dict[str, torch.cuda.Event]] = [{}, {}]
+
         self.layer_param_shapes = [[p.shape for p in layer.parameters()] for layer in self.layers]
         self.layer_param_numels = [[p.numel() for p in layer.parameters()] for layer in self.layers]
         self.layer_numels = [sum(numels) for numels in self.layer_param_numels]
+        self.max_layer_numel = max(self.layer_numels) if self.layer_numels else 0
         self.layer_pinned_flats = [_pin_empty(numel, config.dtype) for numel in self.layer_numels]
+        self.gpu_flat_buffers = [
+            torch.empty(self.max_layer_numel, dtype=config.dtype, device=self.device),
+            torch.empty(self.max_layer_numel, dtype=config.dtype, device=self.device),
+        ]
+        self._grad_tasks: list[
+            tuple[torch.cuda.Event, torch.Tensor, list[torch.nn.Parameter], list[torch.Size], list[int], list[torch.Tensor]]
+        ] = []
 
     def parameters(self):
         return self.model.parameters()
@@ -185,8 +205,11 @@ class FlowTrainTrainer:
             param.grad = None
 
     def cleanup(self) -> None:
-        self.gpu_layer_buffers = [None, None]
-        self.gpu_layer_kinds = [None, None]
+        self._drain_grad_tasks(wait_all=True)
+        self.gpu_layer_templates = [{}, {}]
+        self.template_layer_idx = [{}, {}]
+        self.template_busy_events = [{}, {}]
+        self.template_ready_events = [{}, {}]
         self.activation_store.clear()
         torch.cuda.empty_cache()
 
@@ -209,49 +232,72 @@ class FlowTrainTrainer:
             raise ValueError("sequence length must be >= 2")
 
         self.activation_store.clear()
+        self._grad_tasks.clear()
         self.zero_grad()
         start = time.perf_counter()
 
-        input_ids_gpu = input_ids.to(self.device, non_blocking=True)
-        labels_gpu = labels.to(self.device, non_blocking=True)
-        emb_gpu = self._clone_module_to_gpu(self.embedding)
-
-        checkpoints = {}
-        with torch.no_grad():
+        with torch.cuda.stream(self.compute_stream):
+            input_ids_gpu = input_ids.to(self.device, non_blocking=True)
+            labels_gpu = labels.to(self.device, non_blocking=True)
+            emb_gpu = self._clone_module_to_gpu(self.embedding)
             hidden = emb_gpu(input_ids_gpu)
             v_first = torch.empty_like(hidden)
+
+        checkpoints = {}
+        if self.layers:
+            self._prefetch_layer_async(0, 0)
+        with torch.no_grad():
             for layer_idx in range(len(self.layers)):
+                buffer_idx = layer_idx % 2
+                next_idx = layer_idx + 1
                 if layer_idx % self.config.checkpoint_interval == 0:
+                    self.compute_stream.synchronize()
                     checkpoints[layer_idx] = self.activation_store.checkpoint(hidden, has_v_first=layer_idx > 0)
-                gpu_layer = self._load_layer_to_buffer(layer_idx, layer_idx % 2)
-                hidden, v_first = gpu_layer(hidden, v_first)
+
+                if next_idx < len(self.layers):
+                    self._prefetch_layer_async(next_idx, next_idx % 2)
+
+                gpu_layer = self._wait_for_layer(layer_idx, buffer_idx)
+                with torch.cuda.stream(self.compute_stream):
+                    hidden, v_first = gpu_layer(hidden, v_first)
+                    self._record_buffer_busy(layer_idx, buffer_idx)
                 if layer_idx == 0:
+                    self.compute_stream.synchronize()
                     self.activation_store.save_v_first(v_first)
+
+            self.compute_stream.synchronize()
             checkpoints[len(self.layers)] = self.activation_store.checkpoint(hidden, has_v_first=bool(self.layers))
 
         fwd_end = time.perf_counter()
 
         final_hidden, final_v_first = self.activation_store.unpack(checkpoints[len(self.layers)], self.device)
-        hidden_before_norm = final_hidden.detach().requires_grad_(True)
-        norm_gpu = self._clone_module_to_gpu(self.norm)
-        head_gpu = self._clone_module_to_gpu(self.head)
-
-        hidden_after_norm = norm_gpu(hidden_before_norm)
-        logits = head_gpu(hidden_after_norm[:, :-1, :]).reshape(-1, self.vocab_size).float()
-        targets = labels_gpu[:, 1:].reshape(-1)
-        valid_tokens = int((targets != -100).sum().item())
+        valid_tokens = int((labels[:, 1:] != -100).sum().item())
         if valid_tokens == 0:
             raise ValueError("labels contain no valid next-token targets")
-        loss = F.cross_entropy(logits, targets, ignore_index=-100, reduction="sum") / valid_tokens
-        loss_val = float(loss.detach().cpu())
-        loss.backward()
+
+        with torch.cuda.stream(self.compute_stream):
+            hidden_before_norm = final_hidden.detach().requires_grad_(True)
+            norm_gpu = self._clone_module_to_gpu(self.norm)
+            head_gpu = self._clone_module_to_gpu(self.head)
+            hidden_after_norm = norm_gpu(hidden_before_norm)
+            total_loss = torch.zeros((), device=self.device, dtype=torch.float32)
+            for start_t in range(0, input_ids.shape[1] - 1, self.config.logit_chunk_size):
+                end_t = min(start_t + self.config.logit_chunk_size, input_ids.shape[1] - 1)
+                logits = head_gpu(hidden_after_norm[:, start_t:end_t, :]).reshape(-1, self.vocab_size).float()
+                targets = labels_gpu[:, start_t + 1 : end_t + 1].reshape(-1)
+                total_loss = total_loss + F.cross_entropy(logits, targets, ignore_index=-100, reduction="sum")
+                del logits
+            loss = total_loss / valid_tokens
+            loss.backward()
+            loss_value_tensor = loss.detach().float()
 
         grad_hidden = hidden_before_norm.grad.detach()
         grad_v_first = torch.zeros_like(final_v_first)
-        self._copy_module_grads_to_cpu(head_gpu, self.head)
-        self._copy_module_grads_to_cpu(norm_gpu, self.norm)
+        self._copy_module_grads_to_cpu_async(head_gpu, self.head)
+        self._copy_module_grads_to_cpu_async(norm_gpu, self.norm)
 
-        del logits, hidden_after_norm, hidden_before_norm, final_hidden, final_v_first
+        loss_val = float(loss_value_tensor.cpu())
+        del hidden_after_norm, hidden_before_norm, final_hidden, final_v_first, total_loss
 
         num_blocks = (len(self.layers) + self.config.checkpoint_interval - 1) // self.config.checkpoint_interval
         for block_idx in range(num_blocks - 1, -1, -1):
@@ -262,48 +308,61 @@ class FlowTrainTrainer:
             recompute_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
             hidden_recompute = checkpoint_hidden
             v_first_recompute = checkpoint_v_first
+            if block_start < block_end:
+                self._prefetch_layer_async(block_start, block_start % 2)
             with torch.no_grad():
                 for layer_idx in range(block_start, block_end):
-                    gpu_layer = self._load_layer_to_buffer(layer_idx, layer_idx % 2)
-                    hidden_recompute, v_first_recompute = gpu_layer(hidden_recompute, v_first_recompute)
+                    next_idx = layer_idx + 1
+                    if next_idx < block_end:
+                        self._prefetch_layer_async(next_idx, next_idx % 2)
+                    gpu_layer = self._wait_for_layer(layer_idx, layer_idx % 2)
+                    with torch.cuda.stream(self.compute_stream):
+                        hidden_recompute, v_first_recompute = gpu_layer(hidden_recompute, v_first_recompute)
+                        self._record_buffer_busy(layer_idx, layer_idx % 2)
                     recompute_cache[layer_idx] = (hidden_recompute.detach(), v_first_recompute.detach())
 
             for layer_idx in range(block_end - 1, block_start - 1, -1):
                 if layer_idx == block_start:
-                    layer_input = checkpoint_hidden.detach().requires_grad_(True)
-                    state_input = checkpoint_v_first.detach().requires_grad_(True)
+                    layer_input_base = checkpoint_hidden
+                    state_input_base = checkpoint_v_first
                 else:
-                    cached_hidden, cached_state = recompute_cache[layer_idx - 1]
-                    layer_input = cached_hidden.detach().requires_grad_(True)
-                    state_input = cached_state.detach().requires_grad_(True)
+                    layer_input_base, state_input_base = recompute_cache[layer_idx - 1]
 
-                gpu_layer = self._load_layer_to_buffer(layer_idx, layer_idx % 2)
-                for param in gpu_layer.parameters():
-                    param.requires_grad_(True)
+                self._prefetch_layer_async(layer_idx, layer_idx % 2)
+                gpu_layer = self._wait_for_layer(layer_idx, layer_idx % 2)
+                with torch.cuda.stream(self.compute_stream):
+                    layer_input = layer_input_base.detach().requires_grad_(True)
+                    state_input = state_input_base.detach().requires_grad_(True)
+                    for param in gpu_layer.parameters():
+                        param.requires_grad_(True)
 
-                layer_output, state_output = gpu_layer(layer_input, state_input)
-                grad_targets = (layer_input, state_input, *tuple(gpu_layer.parameters()))
-                grads = torch.autograd.grad(
-                    (layer_output, state_output),
-                    grad_targets,
-                    (grad_hidden, grad_v_first),
-                    retain_graph=False,
-                    create_graph=False,
-                    allow_unused=True,
-                )
-                grad_hidden = grads[0].detach()
-                grad_v_first = grads[1].detach() if grads[1] is not None else torch.zeros_like(state_input)
-                for param, grad in zip(gpu_layer.parameters(), grads[2:], strict=True):
-                    param.grad = grad
-                    param.requires_grad_(False)
-                self._copy_layer_grads_to_cpu(layer_idx, gpu_layer)
+                    layer_output, state_output = gpu_layer(layer_input, state_input)
+                    grad_targets = (layer_input, state_input, *tuple(gpu_layer.parameters()))
+                    grads = torch.autograd.grad(
+                        (layer_output, state_output),
+                        grad_targets,
+                        (grad_hidden, grad_v_first),
+                        retain_graph=False,
+                        create_graph=False,
+                        allow_unused=True,
+                    )
+                    grad_hidden = grads[0].detach()
+                    grad_v_first = grads[1].detach() if grads[1] is not None else torch.zeros_like(state_input)
+                    for param, grad in zip(gpu_layer.parameters(), grads[2:], strict=True):
+                        param.grad = grad
+                        param.requires_grad_(False)
+                    self._record_buffer_busy(layer_idx, layer_idx % 2)
+                self._copy_layer_grads_to_cpu_async(layer_idx, gpu_layer)
+                self._drain_grad_tasks(wait_all=False)
 
             recompute_cache.clear()
 
-        emb_replay = self._clone_module_to_gpu(self.embedding)
-        emb_out = emb_replay(input_ids_gpu)
-        emb_out.backward(grad_hidden)
-        self._copy_module_grads_to_cpu(emb_replay, self.embedding)
+        with torch.cuda.stream(self.compute_stream):
+            emb_replay = self._clone_module_to_gpu(self.embedding)
+            emb_out = emb_replay(input_ids_gpu)
+            emb_out.backward(grad_hidden)
+        self._copy_module_grads_to_cpu_async(emb_replay, self.embedding)
+        self._drain_grad_tasks(wait_all=True)
 
         if self.config.max_grad_norm is not None and self.config.max_grad_norm > 0:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
@@ -330,37 +389,109 @@ class FlowTrainTrainer:
             flat[offset : offset + numel].copy_(param.detach().reshape(-1).to(dtype=self.config.dtype))
             offset += numel
 
-    def _load_layer_to_buffer(self, layer_idx: int, buffer_idx: int) -> nn.Module:
-        kind = "first" if layer_idx == 0 else "regular"
-        shapes = self.layer_param_shapes[layer_idx]
-        gpu_layer = self.gpu_layer_buffers[buffer_idx]
-        if gpu_layer is None or self.gpu_layer_kinds[buffer_idx] != kind:
-            gpu_layer = self._clone_module_to_gpu(self.layers[layer_idx])
-            self.gpu_layer_buffers[buffer_idx] = gpu_layer
-            self.gpu_layer_kinds[buffer_idx] = kind
+    def _layer_template_kind(self, layer_idx: int) -> str:
+        return "first" if layer_idx == 0 else "regular"
+
+    def _ensure_layer_template(self, layer_idx: int, buffer_idx: int) -> nn.Module:
+        kind = self._layer_template_kind(layer_idx)
+        template = self.gpu_layer_templates[buffer_idx].get(kind)
+        if template is not None:
+            return template
+
+        source_idx = 0 if kind == "first" else 1
+        if source_idx >= len(self.layers):
+            source_idx = layer_idx
+        template = self._clone_module_to_gpu(self.layers[source_idx])
+        if kind == "regular":
+            template.layer_id = 1
+            template.att.layer_id = 1
+            template.ffn.layer_id = 1
+        self.gpu_layer_templates[buffer_idx][kind] = template
+        self.template_layer_idx[buffer_idx][kind] = None
+        self.template_busy_events[buffer_idx][kind] = None
+        self.template_ready_events[buffer_idx][kind] = torch.cuda.Event(enable_timing=False)
+        return template
+
+    def _prefetch_layer_async(self, layer_idx: int, buffer_idx: int) -> None:
+        kind = self._layer_template_kind(layer_idx)
+        if self.template_layer_idx[buffer_idx].get(kind) == layer_idx:
+            return
+        gpu_layer = self._ensure_layer_template(layer_idx, buffer_idx)
         self._refresh_layer_flat(layer_idx)
-        flat = self.layer_pinned_flats[layer_idx].to(self.device, non_blocking=True)
-        offset = 0
-        with torch.no_grad():
-            for param, shape, numel in zip(gpu_layer.parameters(), shapes, self.layer_param_numels[layer_idx], strict=True):
-                param.data.copy_(flat[offset : offset + numel].view(shape))
-                param.grad = None
-                param.requires_grad_(False)
+        layer_numel = self.layer_numels[layer_idx]
+        shapes = self.layer_param_shapes[layer_idx]
+        numels = self.layer_param_numels[layer_idx]
+        gpu_flat = self.gpu_flat_buffers[buffer_idx][:layer_numel]
+        busy_event = self.template_busy_events[buffer_idx].get(kind)
+        with torch.cuda.stream(self.weight_stream):
+            if busy_event is not None:
+                self.weight_stream.wait_event(busy_event)
+            gpu_flat.copy_(self.layer_pinned_flats[layer_idx], non_blocking=True)
+            offset = 0
+            with torch.no_grad():
+                for param, shape, numel in zip(gpu_layer.parameters(), shapes, numels, strict=True):
+                    param.data.copy_(gpu_flat[offset : offset + numel].view(shape), non_blocking=True)
+                    param.grad = None
+                    param.requires_grad_(False)
+                    offset += numel
+            self.template_ready_events[buffer_idx][kind].record(self.weight_stream)
+        self.template_layer_idx[buffer_idx][kind] = layer_idx
+
+    def _wait_for_layer(self, layer_idx: int, buffer_idx: int) -> nn.Module:
+        kind = self._layer_template_kind(layer_idx)
+        if self.template_layer_idx[buffer_idx].get(kind) != layer_idx:
+            self._prefetch_layer_async(layer_idx, buffer_idx)
+        self.compute_stream.wait_event(self.template_ready_events[buffer_idx][kind])
+        return self.gpu_layer_templates[buffer_idx][kind]
+
+    def _record_buffer_busy(self, layer_idx: int, buffer_idx: int) -> None:
+        kind = self._layer_template_kind(layer_idx)
+        event = torch.cuda.Event(enable_timing=False)
+        event.record(self.compute_stream)
+        self.template_busy_events[buffer_idx][kind] = event
+
+    def _copy_layer_grads_to_cpu_async(self, layer_idx: int, gpu_layer: nn.Module) -> None:
+        self._copy_grads_to_cpu_async(list(gpu_layer.parameters()), list(self.layers[layer_idx].parameters()))
+
+    def _copy_module_grads_to_cpu_async(self, gpu_module: nn.Module, cpu_module: nn.Module) -> None:
+        self._copy_grads_to_cpu_async(list(gpu_module.parameters()), list(cpu_module.parameters()))
+
+    def _copy_grads_to_cpu_async(self, gpu_params: list[torch.nn.Parameter], cpu_params: list[torch.nn.Parameter]) -> None:
+        entries = [
+            (gpu_param, cpu_param)
+            for gpu_param, cpu_param in zip(gpu_params, cpu_params, strict=True)
+            if gpu_param.grad is not None
+        ]
+        if not entries:
+            return
+        if len(self._grad_tasks) >= self.config.num_grad_slabs:
+            self._drain_grad_tasks(wait_all=False, min_remaining=self.config.num_grad_slabs - 1)
+
+        shapes = [cpu_param.shape for _, cpu_param in entries]
+        numels = [gpu_param.grad.numel() for gpu_param, _ in entries]
+        slab = _pin_empty(sum(numels), self.config.dtype)
+        event = torch.cuda.Event(enable_timing=False)
+        source_grads = []
+        with torch.cuda.stream(self.grad_stream):
+            self.grad_stream.wait_stream(self.compute_stream)
+            offset = 0
+            for (gpu_param, _), numel in zip(entries, numels, strict=True):
+                grad = gpu_param.grad.detach()
+                source_grads.append(grad)
+                slab[offset : offset + numel].copy_(grad.reshape(-1), non_blocking=True)
+                gpu_param.grad = None
                 offset += numel
-        return gpu_layer
+            event.record(self.grad_stream)
+        self._grad_tasks.append((event, slab, [cpu for _, cpu in entries], shapes, numels, source_grads))
 
-    def _copy_layer_grads_to_cpu(self, layer_idx: int, gpu_layer: nn.Module) -> None:
-        self._copy_grads_to_cpu(gpu_layer.parameters(), self.layers[layer_idx].parameters())
-
-    def _copy_module_grads_to_cpu(self, gpu_module: nn.Module, cpu_module: nn.Module) -> None:
-        self._copy_grads_to_cpu(gpu_module.parameters(), cpu_module.parameters())
-
-    def _copy_grads_to_cpu(self, gpu_params, cpu_params) -> None:
-        for gpu_param, cpu_param in zip(gpu_params, cpu_params, strict=True):
-            if gpu_param.grad is None:
-                continue
-            grad_cpu = gpu_param.grad.detach().to(device="cpu", dtype=cpu_param.dtype)
-            if cpu_param.grad is None:
-                cpu_param.grad = torch.zeros_like(cpu_param)
-            cpu_param.grad.add_(grad_cpu)
-            gpu_param.grad = None
+    def _drain_grad_tasks(self, wait_all: bool, min_remaining: int = 0) -> None:
+        while self._grad_tasks and (wait_all or len(self._grad_tasks) > min_remaining):
+            event, slab, cpu_params, shapes, numels, _source_grads = self._grad_tasks.pop(0)
+            event.synchronize()
+            offset = 0
+            for cpu_param, shape, numel in zip(cpu_params, shapes, numels, strict=True):
+                grad = slab[offset : offset + numel].view(shape).to(dtype=cpu_param.dtype)
+                if cpu_param.grad is None:
+                    cpu_param.grad = torch.zeros_like(cpu_param)
+                cpu_param.grad.add_(grad)
+                offset += numel

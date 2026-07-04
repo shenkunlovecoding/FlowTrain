@@ -24,6 +24,7 @@ setup(
     entry_points={
         "console_scripts": [
             "flowtrain-train-rwkv7=flowtrain.cli.train_rwkv7:main",
+            "flowtrain-estimate-rwkv7-bs=flowtrain.cli.estimate_rwkv7_bs:main",
         ],
     },
     classifiers=[
