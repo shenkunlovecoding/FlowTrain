@@ -9,13 +9,23 @@ from typing import Literal
 import torch
 
 from .rwkv7 import lora_ranks, official_rank
-from .trainer import _infer_rwkv7_dims, _parse_checkpoint_state
+from .trainer import infer_rwkv7_config_from_state
 
 
 ActivationOffload = Literal["none", "cpu"]
 ActivationQuant = Literal["none", "int8"]
 ActivationStrategy = Literal["recompute", "store_layer_inputs"]
-OptimizerKind = Literal["adamw", "qr_muon"]
+OptimizerKind = Literal["adamw", "deepspeed_cpu_adam", "qr_muon"]
+
+
+def _checkpoint_state(raw: dict) -> dict[str, torch.Tensor]:
+    if isinstance(raw, dict) and "model" in raw and isinstance(raw["model"], dict):
+        return raw["model"]
+    if isinstance(raw, dict) and "state_dict" in raw and isinstance(raw["state_dict"], dict):
+        return raw["state_dict"]
+    if isinstance(raw, dict):
+        return raw
+    raise TypeError("RWKV-7 checkpoint must be a state_dict-like mapping")
 
 
 @dataclass(frozen=True)
@@ -100,13 +110,14 @@ def infer_size_from_checkpoint(
     head_size: int = 64,
 ) -> RWKV7Size:
     raw = torch.load(checkpoint, map_location="cpu")
-    state = _parse_checkpoint_state(raw)
-    vocab_size, n_embd, n_layer, dim_ffn = _infer_rwkv7_dims(state)
+    state = _checkpoint_state(raw)
+    config = infer_rwkv7_config_from_state(state, ctx_len=1, backend="torch_ref")
+    assert config.dim_ffn is not None
     return RWKV7Size(
-        vocab_size=vocab_size,
-        n_layer=n_layer,
-        n_embd=n_embd,
-        dim_ffn=dim_ffn,
+        vocab_size=config.vocab_size,
+        n_layer=config.n_layer,
+        n_embd=config.n_embd,
+        dim_ffn=config.dim_ffn,
         head_size=head_size,
         lora_rank_style=lora_rank_style,
     )
@@ -162,8 +173,8 @@ def estimate_rwkv7_batch_size(
         raise ValueError("activation_quant='int8' requires activation_offload='cpu'")
     if activation_strategy not in ("recompute", "store_layer_inputs"):
         raise ValueError("activation_strategy must be 'recompute' or 'store_layer_inputs'")
-    if optimizer not in ("adamw", "qr_muon"):
-        raise ValueError("optimizer must be 'adamw' or 'qr_muon'")
+    if optimizer not in ("adamw", "deepspeed_cpu_adam", "qr_muon"):
+        raise ValueError("optimizer must be 'adamw', 'deepspeed_cpu_adam', or 'qr_muon'")
 
     breakdown = rwkv7_param_breakdown(size)
     max_layer = max(breakdown.first_layer_params, breakdown.regular_layer_params)
@@ -210,7 +221,10 @@ def estimate_rwkv7_batch_size(
         optimizer_assumption = "QR Muon states are used for RWKV block projection/LoRA matrices; other params use AdamW"
     else:
         optimizer_state_bytes = breakdown.total_params * optimizer_state_bytes_per_param
-        optimizer_assumption = "CPU params, CPU grads, and AdamW states stay on host memory"
+        if optimizer == "deepspeed_cpu_adam":
+            optimizer_assumption = "CPU params, CPU grads, and DeepSpeed CPUAdam states stay on host memory"
+        else:
+            optimizer_assumption = "CPU params, CPU grads, and AdamW states stay on host memory"
 
     cpu_base_bytes = (
         breakdown.total_params * (param_dtype_bytes + param_dtype_bytes)

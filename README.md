@@ -36,6 +36,12 @@ Runtime dependencies are intentionally small:
 
 No CUDA/C++ extension is built by `setup.py`.
 
+Optional DeepSpeed CPUAdam support:
+
+```bash
+pip install -e ".[deepspeed]"
+```
+
 ## Train
 
 ```bash
@@ -68,7 +74,8 @@ The trainer maintains separate CUDA streams for compute, weight H2D prefetch,
 and gradient D2H transfer. Two GPU layer buffers are alternated so the weight
 stream can prefetch the next block while the compute stream runs the current
 block. CPU gradients are staged through pinned slabs capped by
-`num_grad_slabs`.
+`num_grad_slabs`. Tensor-list copies use a batched foreach path when available,
+falling back to per-tensor copies on unsupported PyTorch builds.
 
 RWKV-7 layer execution uses stateless GPU templates specialized by block kind:
 one template for layer 0, which owns `ln0` and creates `v_first`, and reusable
@@ -78,6 +85,15 @@ streaming schedule.
 
 `make_optimizer` returns FlowTrain's CPU AdamW implementation by default.
 Parameters and optimizer state stay on CPU; updates use PyTorch CPU vector ops.
+Pass `optimizer="deepspeed_cpu_adam"` to use DeepSpeed's SIMD CPUAdam backend
+when the optional `deepspeed` dependency is installed.
+
+```bash
+python examples/rwkv7/train.py \
+  --backend torch_ref \
+  --optimizer deepspeed_cpu_adam
+```
+
 Pass `optimizer="qr_muon"` to enable the RWKV-specialized QR Muon adapter:
 `blocks.*` 2D matrices use streaming power-iteration Muon with shifted
 Cholesky QR, while embeddings, the output head, normalization weights, and
@@ -120,10 +136,10 @@ the host. When the TileLang capability gate is not met (non-bf16, non-CUDA,
 the PyTorch reference recompute path.
 
 Correctness is checked against finite differences in
-`tests/test_recurrence_backward.py`. Each case runs in a fresh subprocess
-because TileLang interns compiled kernels within a process, so compiling the
-recurrence for more than one shape in a single process returns the wrong
-binary; one shape per process (the normal training pattern) is unaffected.
+`tests/test_recurrence_backward.py`. Finite-difference cases run in fresh
+subprocesses for deterministic cache state, and a separate regression case
+checks that multiple recurrence shapes can compile and run in one Python
+process without reusing the wrong TileLang binary.
 
 ## Activation Storage
 

@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-steps", type=int, default=3)
     parser.add_argument("--lr", type=float, default=4e-3)
     parser.add_argument("--weight-decay", type=float, default=0.1)
-    parser.add_argument("--optimizer", choices=("adamw", "qr_muon"), default="adamw")
+    parser.add_argument("--optimizer", choices=("adamw", "deepspeed_cpu_adam", "qr_muon"), default="adamw")
     parser.add_argument("--muon-beta", type=float, default=0.95)
     parser.add_argument("--muon-eps", type=float, default=1e-9)
     parser.add_argument("--checkpoint-interval", type=int, default=1)

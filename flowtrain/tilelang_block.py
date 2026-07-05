@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import warnings
 from dataclasses import dataclass
 from functools import lru_cache
@@ -79,6 +80,7 @@ def _fallback_reason(block: RWKV7Block, x: torch.Tensor, v_first: torch.Tensor) 
         )
         _tilelang_gemm_ops()
         _tilelang_recurrence_ops()
+        _tilelang_time_mix_post_ops()
     except Exception as exc:  # pragma: no cover - depends on local TileLang install.
         return f"TileLang runtime unavailable: {exc}"
     return None
@@ -110,6 +112,30 @@ def _tilelang_recurrence_ops():
 
 
 @lru_cache(maxsize=1)
+def _tilelang_time_mix_post_ops():
+    try:
+        from .tilelang_time_mix import (
+            can_use_time_mix_post_tilelang,
+            can_use_time_mix_shift_tilelang,
+            time_mix_post_tilelang,
+            time_mix_shift_tilelang,
+        )
+    except ImportError:
+        from tilelang_time_mix import (
+            can_use_time_mix_post_tilelang,
+            can_use_time_mix_shift_tilelang,
+            time_mix_post_tilelang,
+            time_mix_shift_tilelang,
+        )
+    return (
+        can_use_time_mix_post_tilelang,
+        time_mix_post_tilelang,
+        can_use_time_mix_shift_tilelang,
+        time_mix_shift_tilelang,
+    )
+
+
+@lru_cache(maxsize=1)
 def _rwkv7_recurrence_ref():
     try:
         from .rwkv7 import rwkv7_recurrence
@@ -128,18 +154,25 @@ def _time_mix_tilelang(att, x: torch.Tensor, v_first: torch.Tensor) -> tuple[tor
     tilelang_linear, tilelang_matmul = _tilelang_gemm_ops()
     bsz, timesteps, channels = x.size()
     h = att.n_head
-    xx = att.time_shift(x) - x
+    can_use_post, time_mix_post_tilelang, can_use_shift, time_mix_shift_tilelang = _tilelang_time_mix_post_ops()
+    if (
+        not torch.is_grad_enabled()
+        and os.environ.get("FLOWTRAIN_DISABLE_TIMEMIX_SHIFT_FUSION") != "1"
+        and can_use_shift(x, att.x_r, att.x_w, att.x_k, att.x_v, att.x_a, att.x_g)
+    ):
+        xr, xw, xk, xv, xa, xg = time_mix_shift_tilelang(x, att.x_r, att.x_w, att.x_k, att.x_v, att.x_a, att.x_g)
+    else:
+        xx = att.time_shift(x) - x
 
-    xr = x + xx * att.x_r
-    xw = x + xx * att.x_w
-    xk = x + xx * att.x_k
-    xv = x + xx * att.x_v
-    xa = x + xx * att.x_a
-    xg = x + xx * att.x_g
+        xr = x + xx * att.x_r
+        xw = x + xx * att.x_w
+        xk = x + xx * att.x_k
+        xv = x + xx * att.x_v
+        xa = x + xx * att.x_a
+        xg = x + xx * att.x_g
 
     r = tilelang_linear(xr, att.receptance.weight)
     raw_w = att.w0 + _matmul3(torch.tanh(_matmul3(xw, att.w1, tilelang_matmul)), att.w2, tilelang_matmul)
-    w = -F.softplus(-raw_w) - 0.5
     k = tilelang_linear(xk, att.key.weight)
     v = tilelang_linear(xv, att.value.weight)
     if att.layer_id == 0:
@@ -153,31 +186,42 @@ def _time_mix_tilelang(att, x: torch.Tensor, v_first: torch.Tensor) -> tuple[tor
     kk = k * att.k_k
     kk = F.normalize(kk.view(bsz, timesteps, h, -1), dim=-1, p=2.0).view(bsz, timesteps, channels)
     k = k * (1 + (a - 1) * att.k_a)
+    neg_kk = -kk
+    kk_a = kk * a
 
     can_use_recurrence, rwkv7_recurrence_tilelang = _tilelang_recurrence_ops()
-    if can_use_recurrence(r, raw_w, k, v, -kk, kk * a, att.head_size, att.config.chunk_len):
+    if can_use_recurrence(r, raw_w, k, v, neg_kk, kk_a, att.head_size, att.config.chunk_len):
         x = rwkv7_recurrence_tilelang(
             r,
             raw_w.to(dtype=r.dtype),
             k,
             v,
-            -kk,
-            kk * a,
+            neg_kk,
+            kk_a,
             att.head_size,
             chunk_len=att.config.chunk_len,
         )
     else:
         rwkv7_recurrence = _rwkv7_recurrence_ref()
-        x = rwkv7_recurrence(r, w, k, v, -kk, kk * a, att.head_size)
+        w = -F.softplus(-raw_w) - 0.5
+        x = rwkv7_recurrence(r, w, k, v, neg_kk, kk_a, att.head_size)
 
-    x = att.ln_x(x.view(bsz * timesteps, channels)).view(bsz, timesteps, channels)
-    x = x + (
-        (r.view(bsz, timesteps, h, -1).float() * k.view(bsz, timesteps, h, -1).float() * att.r_k)
-        .sum(dim=-1, keepdim=True)
-        .to(dtype=r.dtype)
-        * v.view(bsz, timesteps, h, -1)
-    ).view(bsz, timesteps, channels)
-    return tilelang_linear(x * g, att.output.weight), v_first
+    if (
+        not torch.is_grad_enabled()
+        and os.environ.get("FLOWTRAIN_DISABLE_TIMEMIX_POST_FUSION") != "1"
+        and can_use_post(x, r, k, v, g, att.r_k, att.ln_x.weight, att.ln_x.bias, att.head_size)
+    ):
+        x = time_mix_post_tilelang(x, r, k, v, g, att.r_k, att.ln_x.weight, att.ln_x.bias, att.head_size, att.ln_x.eps)
+    else:
+        x = att.ln_x(x.view(bsz * timesteps, channels)).view(bsz, timesteps, channels)
+        x = x + (
+            (r.view(bsz, timesteps, h, -1).float() * k.view(bsz, timesteps, h, -1).float() * att.r_k)
+            .sum(dim=-1, keepdim=True)
+            .to(dtype=r.dtype)
+            * v.view(bsz, timesteps, h, -1)
+        ).view(bsz, timesteps, channels)
+        x = x * g
+    return tilelang_linear(x, att.output.weight), v_first
 
 
 def _channel_mix_tilelang(ffn, x: torch.Tensor) -> torch.Tensor:

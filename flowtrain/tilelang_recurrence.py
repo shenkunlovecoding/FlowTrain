@@ -5,6 +5,7 @@
 # TileLang's get_type_hints raises NameError at JIT time. Eager annotations
 # resolve the dimensions against the enclosing scope as expected.
 
+import os
 from functools import lru_cache
 
 import torch
@@ -52,10 +53,10 @@ def _get_recurrence_forward_kernel(batch: int, timesteps: int, channels: int, he
     import tilelang
     import tilelang.language as T
 
-    n_head = channels // head_size
-
     @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True})
-    def _build_kernel():
+    def _build_kernel(batch: int, timesteps: int, channels: int, head_size: int):
+        n_head = channels // head_size
+
         @T.prim_func
         def kernel(
             r: T.Tensor((batch, timesteps, channels), T.bfloat16),
@@ -97,7 +98,7 @@ def _get_recurrence_forward_kernel(batch: int, timesteps: int, channels: int, he
 
         return kernel
 
-    return _build_kernel()
+    return _build_kernel(batch, timesteps, channels, head_size)
 
 
 def _torch_ref_from_raw_w(
@@ -118,7 +119,7 @@ def _torch_ref_from_raw_w(
     return rwkv7_recurrence(r, w, k, v, a, b, head_size)
 
 
-def _pick_recurrence_chunk(timesteps: int, target: int = 64) -> int:
+def _pick_recurrence_chunk(timesteps: int, target: int | None = None) -> int:
     """Pick a checkpoint chunk size that divides ``timesteps``.
 
     The backward kernel is JIT-specialized on a static chunk size, so the segment
@@ -126,6 +127,8 @@ def _pick_recurrence_chunk(timesteps: int, target: int = 64) -> int:
     the kernel). We prefer ``target`` and fall back through smaller divisors; if
     nothing divides, chunk == timesteps collapses to a single segment.
     """
+    if target is None:
+        target = int(os.environ.get("FLOWTRAIN_RECURRENCE_CHUNK_TARGET", "128"))
     for candidate in (target, target // 2, 32, 16, 8, 4, 2, 1):
         if candidate >= 1 and timesteps % candidate == 0:
             return min(candidate, timesteps)
@@ -155,11 +158,18 @@ def _get_recurrence_backward_kernel(
     import tilelang
     import tilelang.language as T
 
-    n_head = channels // head_size
-    n = head_size
-
     @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True})
-    def _build_kernel():
+    def _build_kernel(
+        batch: int,
+        timesteps: int,
+        channels: int,
+        head_size: int,
+        chunk: int,
+        num_seg: int,
+    ):
+        n_head = channels // head_size
+        n = head_size
+
         @T.prim_func
         def kernel(
             r: T.Tensor((batch, timesteps, channels), T.bfloat16),
@@ -334,7 +344,7 @@ def _get_recurrence_backward_kernel(
 
         return kernel
 
-    return _build_kernel()
+    return _build_kernel(batch, timesteps, channels, head_size, chunk, num_seg)
 
 
 def _can_use_fused_backward(

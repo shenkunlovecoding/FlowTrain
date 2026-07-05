@@ -395,12 +395,12 @@ def make_optimizer(
     weight_decay: float = 0.1,
     betas: tuple[float, float] = (0.9, 0.99),
     eps: float = 1e-18,
-    optimizer: Literal["adamw", "qr_muon"] = "adamw",
+    optimizer: Literal["adamw", "deepspeed_cpu_adam", "qr_muon"] = "adamw",
     muon_beta: float = 0.95,
     muon_eps: float = 1e-9,
     muon_double_qr: bool = True,
 ):
-    from .optimizer import CPUAdamW, CPUQRMuon
+    from .optimizer import CPUAdamW, CPUQRMuon, DeepSpeedCPUAdamW
 
     groups = model.optimizer_groups(weight_decay=weight_decay)
     if optimizer == "qr_muon":
@@ -414,11 +414,13 @@ def make_optimizer(
             muon_eps=muon_eps,
             muon_double_qr=muon_double_qr,
         )
-    if optimizer != "adamw":
-        raise ValueError("optimizer must be 'adamw' or 'qr_muon'")
+    if optimizer not in ("adamw", "deepspeed_cpu_adam"):
+        raise ValueError("optimizer must be 'adamw', 'deepspeed_cpu_adam', or 'qr_muon'")
 
     for group in groups:
         group.pop("names", None)
+    if optimizer == "deepspeed_cpu_adam":
+        return DeepSpeedCPUAdamW(groups, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
     return CPUAdamW(groups, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
 
 

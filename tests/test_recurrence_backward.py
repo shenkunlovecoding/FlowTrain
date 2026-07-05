@@ -1,10 +1,8 @@
 """Correctness tests for the fused TileLang RWKV-7 recurrence backward kernel.
 
-Each case runs in a fresh subprocess. TileLang 0.1.11 interns compiled kernels
-within a process, so compiling the recurrence for more than one shape (or with a
-polluted disk cache) makes later lookups return the wrong binary. One shape per
-process sidesteps that entirely; the worker also clears the TileLang disk cache
-on entry for determinism.
+Finite-difference correctness cases run in fresh subprocesses and clear the
+TileLang disk cache on entry for determinism. A separate cache-regression case
+keeps multiple shapes in one process to catch frontend-cache key collisions.
 """
 
 from __future__ import annotations
@@ -100,13 +98,53 @@ def run(batch, timesteps, channels, chunk_len, seed, n_fd):
 
 # chunk picker is pure python; check it here too
 assert _pick_recurrence_chunk(16) == 16
-assert _pick_recurrence_chunk(128) == 64
+assert _pick_recurrence_chunk(128) == 128
+assert _pick_recurrence_chunk(128, target=64) == 64
 assert _pick_recurrence_chunk(48) == 16
 assert _pick_recurrence_chunk(8) == 8
 
 tag, batch, timesteps, channels, chunk_len, seed, n_fd = sys.argv[1:8]
 run(int(batch), int(timesteps), int(channels), int(chunk_len), int(seed), int(n_fd))
 print(tag, "OK")
+'''
+
+
+CACHE_WORKER = r'''
+import shutil
+from pathlib import Path
+
+for p in (Path.home() / ".tilelang",):
+    if p.exists():
+        shutil.rmtree(p, ignore_errors=True)
+
+import torch
+from flowtrain.tilelang_recurrence import rwkv7_recurrence_tilelang
+
+HEAD = 64
+NAMES = ("r", "raw_w", "k", "v", "a", "b")
+
+
+def run(batch, timesteps, channels, seed):
+    assert torch.cuda.is_available(), "no cuda"
+    torch.manual_seed(seed)
+    inputs = [
+        (torch.randn(batch, timesteps, channels, device="cuda", dtype=torch.bfloat16) * 0.1)
+        .detach()
+        .requires_grad_(True)
+        for _ in NAMES
+    ]
+    out = rwkv7_recurrence_tilelang(*inputs, HEAD, chunk_len=16)
+    assert out.shape == (batch, timesteps, channels)
+    grads = torch.autograd.grad(out.float().sum(), tuple(inputs), allow_unused=True)
+    for grad, tensor in zip(grads, inputs):
+        assert grad is not None
+        assert grad.shape == tensor.shape
+
+
+run(1, 16, 64, 0)
+run(1, 32, 256, 1)
+run(1, 16, 64, 2)
+print("cache-regression OK")
 '''
 
 
@@ -121,6 +159,18 @@ def _run_case_subprocess(tag: str, case: dict) -> None:
     proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=900)
     assert proc.returncode == 0, (
         f"{tag} failed (rc={proc.returncode}):\n--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr[-4000:]}"
+    )
+
+
+def _run_cache_regression_subprocess() -> None:
+    if not torch_cuda_available():
+        return
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    proc = subprocess.run([sys.executable, "-c", CACHE_WORKER], env=env, capture_output=True, text=True, timeout=900)
+    assert proc.returncode == 0, (
+        f"cache regression failed (rc={proc.returncode}):\n"
+        f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr[-4000:]}"
     )
 
 
@@ -152,15 +202,22 @@ def test_pick_recurrence_chunk():
     from flowtrain.tilelang_recurrence import _pick_recurrence_chunk
 
     assert _pick_recurrence_chunk(16) == 16
-    assert _pick_recurrence_chunk(128) == 64      # 2 segments of 64
+    assert _pick_recurrence_chunk(128) == 128     # default target is one larger segment
+    assert _pick_recurrence_chunk(128, target=64) == 64  # explicit legacy 2 segments of 64
     assert _pick_recurrence_chunk(48) == 16       # divisor fallback, 3 segments
     assert _pick_recurrence_chunk(8) == 8         # smaller than target -> single segment
     assert _pick_recurrence_chunk(64) == 64
 
 
+def test_recurrence_cache_accepts_multiple_shapes_in_one_process():
+    _run_cache_regression_subprocess()
+
+
 if __name__ == "__main__":
     test_pick_recurrence_chunk()
     print("pick_recurrence_chunk ok")
+    test_recurrence_cache_accepts_multiple_shapes_in_one_process()
+    print("cache regression ok")
     for tag in ("short", "multiseg", "fallback_chunk", "long"):
         _run_case_subprocess(tag, CASES[tag])
         print(tag, "ok")

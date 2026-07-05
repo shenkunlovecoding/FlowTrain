@@ -176,6 +176,80 @@ class CPUAdamW:
             self.state[params[int(index)]] = value
 
 
+class DeepSpeedCPUAdamW:
+    """Optional DeepSpeed CPUAdam wrapper with FlowTrain-style grad clipping."""
+
+    def __init__(
+        self,
+        params: Iterable[torch.nn.Parameter] | Iterable[dict[str, Any]],
+        lr: float = 1e-3,
+        betas: tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+        weight_decay: float = 0.01,
+        max_grad_norm: float | None = 1.0,
+    ):
+        try:
+            from deepspeed.ops.adam import DeepSpeedCPUAdam
+        except ImportError as exc:
+            raise ImportError(
+                "optimizer='deepspeed_cpu_adam' requires deepspeed; install it or use optimizer='adamw'"
+            ) from exc
+
+        groups = CPUAdamW(
+            params,
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            max_grad_norm=max_grad_norm,
+        ).param_groups
+        self.max_grad_norm = max_grad_norm
+        self.optimizer = DeepSpeedCPUAdam(
+            groups,
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+        )
+        self.param_groups = self.optimizer.param_groups
+
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        self.optimizer.zero_grad(set_to_none=set_to_none)
+
+    def clip_gradients(self) -> float:
+        if self.max_grad_norm is None or self.max_grad_norm <= 0:
+            return 0.0
+        params_with_grad = [
+            param
+            for group in self.param_groups
+            for param in group["params"]
+            if param.grad is not None
+        ]
+        if not params_with_grad:
+            return 0.0
+        total_norm = torch.linalg.vector_norm(
+            torch.stack([param.grad.detach().float().norm(2) for param in params_with_grad]),
+            ord=2,
+        )
+        clip_coef = self.max_grad_norm / (float(total_norm) + 1e-8)
+        if clip_coef < 1.0:
+            for param in params_with_grad:
+                param.grad.mul_(clip_coef)
+        return float(total_norm)
+
+    @torch.no_grad()
+    def step(self) -> float:
+        grad_norm = self.clip_gradients()
+        self.optimizer.step()
+        return grad_norm
+
+    def state_dict(self) -> dict[str, Any]:
+        return self.optimizer.state_dict()
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        self.optimizer.load_state_dict(state_dict)
+
+
 def _reduced_qr(a: torch.Tensor) -> torch.Tensor:
     q, _ = torch.linalg.qr(a, mode="reduced")
     return q

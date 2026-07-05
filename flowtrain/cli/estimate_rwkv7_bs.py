@@ -26,7 +26,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--activation-offload", choices=("none", "cpu"), default="cpu")
     parser.add_argument("--activation-quant", choices=("none", "int8"), default="none")
     parser.add_argument("--activation-strategy", choices=("recompute", "store_layer_inputs"), default="recompute")
-    parser.add_argument("--optimizer", choices=("adamw", "qr_muon"), default="adamw")
+    parser.add_argument("--optimizer", choices=("adamw", "deepspeed_cpu_adam", "qr_muon"), default="adamw")
     parser.add_argument("--gpu-gb", type=float, default=None)
     parser.add_argument("--cpu-gb", type=float, default=None)
     parser.add_argument("--device", type=int, default=0)

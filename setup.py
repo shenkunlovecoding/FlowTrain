@@ -21,6 +21,9 @@ setup(
         "numpy",
         "pyyaml",
     ],
+    extras_require={
+        "deepspeed": ["deepspeed"],
+    },
     entry_points={
         "console_scripts": [
             "flowtrain-train-rwkv7=flowtrain.cli.train_rwkv7:main",

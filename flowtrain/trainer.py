@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import queue
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,6 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .activation_store import ActivationOffload, ActivationQuant, RWKV7ActivationStore
+from .copy_ops import batched_copy_
 from .rwkv7 import RWKV7, RWKV7Config
 
 logger = logging.getLogger(__name__)
@@ -175,6 +177,7 @@ class FlowTrainTrainer:
         self.compute_stream = torch.cuda.Stream(device=self.device)
         self.weight_stream = torch.cuda.Stream(device=self.device)
         self.grad_stream = torch.cuda.Stream(device=self.device)
+        self.activation_stream = torch.cuda.Stream(device=self.device)
         self.activation_store = RWKV7ActivationStore(config.activation_offload, config.activation_quant)
         self.gpu_layer_templates: list[dict[str, nn.Module]] = [{}, {}]
         self.template_layer_idx: list[dict[str, int | None]] = [{}, {}]
@@ -190,8 +193,17 @@ class FlowTrainTrainer:
             torch.empty(self.max_layer_numel, dtype=config.dtype, device=self.device),
             torch.empty(self.max_layer_numel, dtype=config.dtype, device=self.device),
         ]
+        grad_slab_numel = max(
+            [self.max_layer_numel, sum(p.numel() for p in self.embedding.parameters()), sum(p.numel() for p in self.head.parameters()) + sum(p.numel() for p in self.norm.parameters())],
+            default=1,
+        )
+        self.grad_slabs = [_pin_empty(grad_slab_numel, config.dtype) for _ in range(config.num_grad_slabs)]
+        self.grad_slab_events = [torch.cuda.Event(enable_timing=False) for _ in range(config.num_grad_slabs)]
+        self.grad_slab_free: queue.SimpleQueue[int] = queue.SimpleQueue()
+        for slab_idx in range(config.num_grad_slabs):
+            self.grad_slab_free.put(slab_idx)
         self._grad_tasks: list[
-            tuple[torch.cuda.Event, torch.Tensor, list[torch.nn.Parameter], list[torch.Size], list[int], list[torch.Tensor]]
+            tuple[int, torch.cuda.Event, torch.Tensor, list[torch.nn.Parameter], list[torch.Size], list[int], list[torch.Tensor]]
         ] = []
 
     def parameters(self):
@@ -234,8 +246,8 @@ class FlowTrainTrainer:
         if input_ids.shape[1] < 2:
             raise ValueError("sequence length must be >= 2")
 
+        self._drain_grad_tasks(wait_all=True)
         self.activation_store.clear()
-        self._grad_tasks.clear()
         self.zero_grad()
         start = time.perf_counter()
 
@@ -255,8 +267,7 @@ class FlowTrainTrainer:
                 buffer_idx = layer_idx % 2
                 next_idx = layer_idx + 1
                 if store_layer_inputs or layer_idx % self.config.checkpoint_interval == 0:
-                    self.compute_stream.synchronize()
-                    checkpoints[layer_idx] = self.activation_store.checkpoint(hidden, has_v_first=layer_idx > 0)
+                    checkpoints[layer_idx] = self._checkpoint_activation(hidden, has_v_first=layer_idx > 0)
 
                 if next_idx < len(self.layers):
                     self._prefetch_layer_async(next_idx, next_idx % 2)
@@ -266,15 +277,13 @@ class FlowTrainTrainer:
                     hidden, v_first = gpu_layer(hidden, v_first)
                     self._record_buffer_busy(layer_idx, buffer_idx)
                 if layer_idx == 0:
-                    self.compute_stream.synchronize()
-                    self.activation_store.save_v_first(v_first)
+                    self._save_v_first(v_first)
 
-            self.compute_stream.synchronize()
-            checkpoints[len(self.layers)] = self.activation_store.checkpoint(hidden, has_v_first=bool(self.layers))
+            checkpoints[len(self.layers)] = self._checkpoint_activation(hidden, has_v_first=bool(self.layers))
 
         fwd_end = time.perf_counter()
 
-        final_hidden, final_v_first = self.activation_store.unpack(checkpoints[len(self.layers)], self.device)
+        final_hidden, final_v_first = self._unpack_activation(checkpoints[len(self.layers)])
         valid_tokens = int((labels[:, 1:] != -100).sum().item())
         if valid_tokens == 0:
             raise ValueError("labels contain no valid next-token targets")
@@ -305,7 +314,7 @@ class FlowTrainTrainer:
 
         if self.config.activation_strategy == "store_layer_inputs":
             for layer_idx in range(len(self.layers) - 1, -1, -1):
-                layer_input_base, state_input_base = self.activation_store.unpack(checkpoints[layer_idx], self.device)
+                layer_input_base, state_input_base = self._unpack_activation(checkpoints[layer_idx])
                 grad_hidden, grad_v_first = self._replay_one_layer_backward(
                     layer_idx,
                     layer_input_base,
@@ -318,7 +327,7 @@ class FlowTrainTrainer:
             for block_idx in range(num_blocks - 1, -1, -1):
                 block_start = block_idx * self.config.checkpoint_interval
                 block_end = min((block_idx + 1) * self.config.checkpoint_interval, len(self.layers))
-                checkpoint_hidden, checkpoint_v_first = self.activation_store.unpack(checkpoints[block_start], self.device)
+                checkpoint_hidden, checkpoint_v_first = self._unpack_activation(checkpoints[block_start])
 
                 recompute_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
                 hidden_recompute = checkpoint_hidden
@@ -412,13 +421,31 @@ class FlowTrainTrainer:
         gpu_module.train(module.training)
         return gpu_module
 
+    def _checkpoint_activation(self, hidden: torch.Tensor, has_v_first: bool):
+        with torch.cuda.stream(self.activation_stream):
+            self.activation_stream.wait_stream(self.compute_stream)
+            return self.activation_store.checkpoint(hidden, has_v_first=has_v_first)
+
+    def _save_v_first(self, v_first: torch.Tensor) -> None:
+        with torch.cuda.stream(self.activation_stream):
+            self.activation_stream.wait_stream(self.compute_stream)
+            self.activation_store.save_v_first(v_first)
+
+    def _unpack_activation(self, checkpoint):
+        with torch.cuda.stream(self.compute_stream):
+            return self.activation_store.unpack(checkpoint, self.device)
+
     def _refresh_layer_flat(self, layer_idx: int) -> None:
         flat = self.layer_pinned_flats[layer_idx]
         offset = 0
+        destinations = []
+        sources = []
         for param in self.layers[layer_idx].parameters():
             numel = param.numel()
-            flat[offset : offset + numel].copy_(param.detach().reshape(-1).to(dtype=self.config.dtype))
+            destinations.append(flat[offset : offset + numel])
+            sources.append(param.detach().reshape(-1).to(dtype=self.config.dtype))
             offset += numel
+        batched_copy_(destinations, sources)
 
     def _layer_template_kind(self, layer_idx: int) -> str:
         return "first" if layer_idx == 0 else "regular"
@@ -459,12 +486,16 @@ class FlowTrainTrainer:
                 self.weight_stream.wait_event(busy_event)
             gpu_flat.copy_(self.layer_pinned_flats[layer_idx], non_blocking=True)
             offset = 0
+            destinations = []
+            sources = []
             with torch.no_grad():
                 for param, shape, numel in zip(gpu_layer.parameters(), shapes, numels, strict=True):
-                    param.data.copy_(gpu_flat[offset : offset + numel].view(shape), non_blocking=True)
+                    destinations.append(param.data)
+                    sources.append(gpu_flat[offset : offset + numel].view(shape))
                     param.grad = None
                     param.requires_grad_(False)
                     offset += numel
+                batched_copy_(destinations, sources, non_blocking=True)
             self.template_ready_events[buffer_idx][kind].record(self.weight_stream)
         self.template_layer_idx[buffer_idx][kind] = layer_idx
 
@@ -500,24 +531,30 @@ class FlowTrainTrainer:
 
         shapes = [cpu_param.shape for _, cpu_param in entries]
         numels = [gpu_param.grad.numel() for gpu_param, _ in entries]
-        slab = _pin_empty(sum(numels), self.config.dtype)
-        event = torch.cuda.Event(enable_timing=False)
+        total_numel = sum(numels)
+        slab_idx = self.grad_slab_free.get()
+        slab = self.grad_slabs[slab_idx][:total_numel]
+        event = self.grad_slab_events[slab_idx]
         source_grads = []
         with torch.cuda.stream(self.grad_stream):
             self.grad_stream.wait_stream(self.compute_stream)
             offset = 0
+            destinations = []
+            sources = []
             for (gpu_param, _), numel in zip(entries, numels, strict=True):
                 grad = gpu_param.grad.detach()
                 source_grads.append(grad)
-                slab[offset : offset + numel].copy_(grad.reshape(-1), non_blocking=True)
+                destinations.append(slab[offset : offset + numel])
+                sources.append(grad.reshape(-1))
                 gpu_param.grad = None
                 offset += numel
+            batched_copy_(destinations, sources, non_blocking=True)
             event.record(self.grad_stream)
-        self._grad_tasks.append((event, slab, [cpu for _, cpu in entries], shapes, numels, source_grads))
+        self._grad_tasks.append((slab_idx, event, slab, [cpu for _, cpu in entries], shapes, numels, source_grads))
 
     def _drain_grad_tasks(self, wait_all: bool, min_remaining: int = 0) -> None:
         while self._grad_tasks and (wait_all or len(self._grad_tasks) > min_remaining):
-            event, slab, cpu_params, shapes, numels, _source_grads = self._grad_tasks.pop(0)
+            slab_idx, event, slab, cpu_params, shapes, numels, _source_grads = self._grad_tasks.pop(0)
             event.synchronize()
             offset = 0
             for cpu_param, shape, numel in zip(cpu_params, shapes, numels, strict=True):
@@ -526,3 +563,4 @@ class FlowTrainTrainer:
                     cpu_param.grad = torch.zeros_like(cpu_param)
                 cpu_param.grad.add_(grad)
                 offset += numel
+            self.grad_slab_free.put(slab_idx)

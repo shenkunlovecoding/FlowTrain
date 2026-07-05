@@ -18,6 +18,7 @@ class _PackedTensor:
     shape: torch.Size
     tensor: torch.Tensor | None = None
     scale: torch.Tensor | None = None
+    ready_event: torch.cuda.Event | None = None
 
     @property
     def nbytes(self) -> int:
@@ -103,6 +104,7 @@ class RWKV7ActivationStore:
 
         if self.quant == "int8":
             payload, scale = self._quantize_int8(detached)
+            event = _record_ready_event(detached.device) if detached.is_cuda else None
             return _PackedTensor(
                 mode="int8",
                 dtype=detached.dtype,
@@ -110,19 +112,25 @@ class RWKV7ActivationStore:
                 shape=detached.shape,
                 tensor=payload,
                 scale=scale,
+                ready_event=event,
             )
 
         cpu = _empty_cpu(detached.shape, detached.dtype, pin_memory=detached.is_cuda)
         cpu.copy_(detached, non_blocking=detached.is_cuda)
+        if detached.is_cuda:
+            detached.record_stream(torch.cuda.current_stream(detached.device))
+        event = _record_ready_event(detached.device) if detached.is_cuda else None
         return _PackedTensor(
             mode="cpu",
             dtype=detached.dtype,
             device=detached.device,
             shape=detached.shape,
             tensor=cpu,
+            ready_event=event,
         )
 
     def _unpack(self, packed: _PackedTensor, device: torch.device) -> torch.Tensor:
+        _wait_ready_event(packed, device)
         if packed.mode == "gpu":
             assert packed.tensor is not None
             return packed.tensor.to(device=device, dtype=packed.dtype, non_blocking=True)
@@ -145,4 +153,18 @@ class RWKV7ActivationStore:
         s_cpu = _empty_cpu(scale.shape, torch.float16, pin_memory=tensor.is_cuda)
         q_cpu.copy_(quantized, non_blocking=tensor.is_cuda)
         s_cpu.copy_(scale.to(torch.float16), non_blocking=tensor.is_cuda)
+        if tensor.is_cuda:
+            quantized.record_stream(torch.cuda.current_stream(tensor.device))
+            scale.record_stream(torch.cuda.current_stream(tensor.device))
         return q_cpu, s_cpu
+
+
+def _record_ready_event(device: torch.device) -> torch.cuda.Event:
+    event = torch.cuda.Event(enable_timing=False)
+    event.record(torch.cuda.current_stream(device))
+    return event
+
+
+def _wait_ready_event(packed: _PackedTensor, device: torch.device) -> None:
+    if packed.ready_event is not None and device.type == "cuda":
+        torch.cuda.current_stream(device).wait_event(packed.ready_event)
