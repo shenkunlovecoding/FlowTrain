@@ -41,8 +41,15 @@ Use `rg` for text/file searches when semantic navigation is not enough.
 - `flowtrain/tilelang_time_mix.py`, `flowtrain/tilelang_gemm.py`,
   `flowtrain/tilelang_block.py`: TileLang acceleration paths and fallbacks.
 - `flowtrain/cli/train_rwkv7.py`: `flowtrain-train-rwkv7` smoke-training CLI.
+- `flowtrain/cli/train_sft.py`: `flowtrain-train-sft` supervised fine-tuning CLI.
 - `flowtrain/cli/estimate_rwkv7_bs.py`: `flowtrain-estimate-rwkv7-bs` CLI.
+- `flowtrain/sft_data.py`: JSONL SFT dataset + collator (messages /
+  prompt+completion / instruction+output / text) with prompt-token loss masking.
+- `flowtrain/cpu_accum.py` + `flowtrain/csrc/cpu_accum.cpp`: optional batched CPU
+  grad-slab accumulation; JIT-built via `torch.utils.cpp_extension.load` with a
+  pure-Python `foreach` fallback when the local toolchain cannot build it.
 - `examples/rwkv7/train.py`: source-tree RWKV-7 training smoke entrypoint.
+- `examples/sft/train.py`: source-tree SFT entrypoint.
 - `scripts/measure_rwkv7_activation.py`: real activation-memory calibration.
 - `scripts/benchmark_recurrence.py`: recurrence kernel timing sweep.
 - `tests/`: CPU API tests plus CUDA/TileLang recurrence regression tests.
@@ -61,6 +68,10 @@ Runtime dependencies are intentionally small and mirrored in `requirements.txt`:
 pip install -r requirements.txt
 ```
 
+Optional extras (full detail in README): `pip install -e ".[deepspeed]"` for
+DeepSpeed CPUAdam, `pip install -e ".[sft]"` for the SFT tokenizer path
+(`transformers`).
+
 CLI smoke train:
 
 ```bash
@@ -71,6 +82,14 @@ Source-tree smoke train:
 
 ```bash
 python examples/rwkv7/train.py --backend tilelang
+```
+
+Supervised fine-tuning (JSONL records; masks prompt tokens by default,
+`--full-sequence-loss` to train on all tokens):
+
+```bash
+flowtrain-train-sft --dataset data/sft.jsonl --tokenizer /path/to/tok \
+  --checkpoint model.pth --backend tilelang
 ```
 
 Batch-size estimate:
@@ -139,6 +158,11 @@ PYTHONDONTWRITEBYTECODE=1 python -m py_compile $(find flowtrain examples scripts
   `chunk_len` divisibility.
 - Avoid `.item()` / `.cpu()` in hot training paths unless synchronization is
   intentional and measured.
+- The CPU grad-slab accumulation extension (`flowtrain/cpu_accum.py` +
+  `csrc/cpu_accum.cpp`) is optional: JIT-built on first use with a pure-Python
+  fallback. Set `FLOWTRAIN_DISABLE_CPU_ACCUM_CPP=1` to force the fallback; never
+  make it a hard setup-time build requirement (README states setup.py builds no
+  C/C++ extension).
 
 ## Style Notes
 

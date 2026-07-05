@@ -32,6 +32,7 @@ class RWKV7Config:
     dim_att: int | None = None
     dim_ffn: int | None = None
     lora_rank_style: str = "official"
+    lora_rank_overrides: dict[int, tuple[int, int, int, int]] | None = None
     backend: Literal["tilelang", "torch_ref"] = "tilelang"
     chunk_len: int = 16
 
@@ -76,6 +77,13 @@ def lora_ranks(c: int, style: str) -> tuple[int, int, int, int]:
     if style == "simplified":
         return 8, 8, 8, 8
     raise ValueError(f"unknown lora_rank_style: {style}")
+
+
+def _layer_lora_ranks(config: RWKV7Config, layer_id: int) -> tuple[int, int, int, int]:
+    """Resolve lora ranks for a specific layer, checking per-layer overrides first."""
+    if config.lora_rank_overrides is not None and layer_id in config.lora_rank_overrides:
+        return config.lora_rank_overrides[layer_id]
+    return lora_ranks(config.n_embd, config.lora_rank_style)
 
 
 def rwkv7_recurrence(r: torch.Tensor, w: torch.Tensor, k: torch.Tensor, v: torch.Tensor, a: torch.Tensor, b: torch.Tensor, head_size: int) -> torch.Tensor:
@@ -139,7 +147,7 @@ class RWKV7TimeMix(nn.Module):
             zigzag = zigzag * torch.abs(zigzag)
             www = -6 + 6 * (torch.arange(c, dtype=torch.float32) / (c - 1)) ** (1 + ratio_0_to_1**0.3)
 
-            d_decay, d_aaa, d_mv, d_gate = lora_ranks(c, config.lora_rank_style)
+            d_decay, d_aaa, d_mv, d_gate = _layer_lora_ranks(config, layer_id)
             self.w1 = nn.Parameter(torch.zeros(c, d_decay))
             self.w2 = nn.Parameter(_ortho_init(torch.zeros(d_decay, c), 0.1))
             self.w0 = nn.Parameter(www.reshape(1, 1, c) + 0.5 + zigzag * 2.5)
@@ -395,12 +403,14 @@ def make_optimizer(
     weight_decay: float = 0.1,
     betas: tuple[float, float] = (0.9, 0.99),
     eps: float = 1e-18,
-    optimizer: Literal["adamw", "deepspeed_cpu_adam", "qr_muon"] = "adamw",
+    optimizer: Literal["adamw", "deepspeed_cpu_adam", "qr_muon", "adamw8bit"] = "adamw",
     muon_beta: float = 0.95,
     muon_eps: float = 1e-9,
     muon_double_qr: bool = True,
+    block_size: int = 256,
+    min_quantized_numel: int = 4096,
 ):
-    from .optimizer import CPUAdamW, CPUQRMuon, DeepSpeedCPUAdamW
+    from .optimizer import CPU8bitAdamW, CPUAdamW, CPUQRMuon, DeepSpeedCPUAdamW
 
     groups = model.optimizer_groups(weight_decay=weight_decay)
     if optimizer == "qr_muon":
@@ -414,13 +424,23 @@ def make_optimizer(
             muon_eps=muon_eps,
             muon_double_qr=muon_double_qr,
         )
-    if optimizer not in ("adamw", "deepspeed_cpu_adam"):
-        raise ValueError("optimizer must be 'adamw', 'deepspeed_cpu_adam', or 'qr_muon'")
+    if optimizer not in ("adamw", "deepspeed_cpu_adam", "adamw8bit"):
+        raise ValueError("optimizer must be 'adamw', 'deepspeed_cpu_adam', 'qr_muon', or 'adamw8bit'")
 
     for group in groups:
         group.pop("names", None)
     if optimizer == "deepspeed_cpu_adam":
         return DeepSpeedCPUAdamW(groups, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+    if optimizer == "adamw8bit":
+        return CPU8bitAdamW(
+            groups,
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            block_size=block_size,
+            min_quantized_numel=min_quantized_numel,
+        )
     return CPUAdamW(groups, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
 
 

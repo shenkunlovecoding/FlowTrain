@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import concurrent.futures
 import logging
 import queue
 import time
@@ -14,7 +15,8 @@ import torch.nn.functional as F
 
 from .activation_store import ActivationOffload, ActivationQuant, RWKV7ActivationStore
 from .copy_ops import batched_copy_
-from .rwkv7 import RWKV7, RWKV7Config
+from .cpu_accum import accumulate_grad_slab_
+from .rwkv7 import RWKV7, RWKV7Config, lora_ranks
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +94,29 @@ def infer_rwkv7_config_from_state(
     dim_ffn = state.get("blocks.0.ffn.key.weight")
     if dim_ffn is None:
         raise ValueError("checkpoint does not look like an RWKV-7 state_dict: missing blocks.0.ffn.key.weight")
+
+    # Detect per-layer lora rank overrides. Some RWKV-7 checkpoints (e.g. g1g)
+    # use different lora dimensions across layer groups; read the actual shape
+    # of each layer's ``att.w1`` (first LoRA projection) to derive overrides.
+    lora_rank_overrides: dict[int, tuple[int, int, int, int]] = {}
+    default_ranks = lora_ranks(n_embd, "official")
+    for lid in sorted(layer_ids):
+        w1_key = f"blocks.{lid}.att.w1"
+        a1_key = f"blocks.{lid}.att.a1"
+        v1_key = f"blocks.{lid}.att.v1"
+        g1_key = f"blocks.{lid}.att.g1"
+        w1 = state.get(w1_key)
+        a1 = state.get(a1_key)
+        v1 = state.get(v1_key)
+        g1 = state.get(g1_key)
+        if w1 is None or a1 is None or v1 is None or g1 is None:
+            continue
+        ranks = (w1.shape[1], a1.shape[1], v1.shape[1], g1.shape[1])
+        if ranks != default_ranks:
+            lora_rank_overrides[lid] = ranks
+    if not lora_rank_overrides:
+        lora_rank_overrides.clear()  # keep None if no overrides needed
+
     return RWKV7Config(
         vocab_size=vocab_size,
         n_layer=n_layer,
@@ -99,6 +124,7 @@ def infer_rwkv7_config_from_state(
         ctx_len=ctx_len,
         head_size=64,
         dim_ffn=dim_ffn.shape[0],
+        lora_rank_overrides=lora_rank_overrides if lora_rank_overrides else None,
         backend=backend,
         chunk_len=chunk_len,
     )
@@ -189,6 +215,7 @@ class FlowTrainTrainer:
         self.layer_numels = [sum(numels) for numels in self.layer_param_numels]
         self.max_layer_numel = max(self.layer_numels) if self.layer_numels else 0
         self.layer_pinned_flats = [_pin_empty(numel, config.dtype) for numel in self.layer_numels]
+        self.layer_flat_dirty = [True for _ in self.layers]
         self.gpu_flat_buffers = [
             torch.empty(self.max_layer_numel, dtype=config.dtype, device=self.device),
             torch.empty(self.max_layer_numel, dtype=config.dtype, device=self.device),
@@ -205,6 +232,8 @@ class FlowTrainTrainer:
         self._grad_tasks: list[
             tuple[int, torch.cuda.Event, torch.Tensor, list[torch.nn.Parameter], list[torch.Size], list[int], list[torch.Tensor]]
         ] = []
+        self.grad_accum_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="flowtrain-grad")
+        self._grad_accum_futures: list[concurrent.futures.Future] = []
 
     def parameters(self):
         return self.model.parameters()
@@ -221,6 +250,7 @@ class FlowTrainTrainer:
 
     def cleanup(self) -> None:
         self._drain_grad_tasks(wait_all=True)
+        self.grad_accum_executor.shutdown(wait=True)
         self.gpu_layer_templates = [{}, {}]
         self.template_layer_idx = [{}, {}]
         self.template_busy_events = [{}, {}]
@@ -249,6 +279,7 @@ class FlowTrainTrainer:
         self._drain_grad_tasks(wait_all=True)
         self.activation_store.clear()
         self.zero_grad()
+        self.layer_flat_dirty = [True for _ in self.layers]
         start = time.perf_counter()
 
         with torch.cuda.stream(self.compute_stream):
@@ -308,6 +339,7 @@ class FlowTrainTrainer:
         grad_v_first = torch.zeros_like(final_v_first)
         self._copy_module_grads_to_cpu_async(head_gpu, self.head)
         self._copy_module_grads_to_cpu_async(norm_gpu, self.norm)
+        self._drain_ready_grad_tasks()
 
         loss_val = float(loss_value_tensor.cpu())
         del hidden_after_norm, hidden_before_norm, final_hidden, final_v_first, total_loss
@@ -365,6 +397,7 @@ class FlowTrainTrainer:
             emb_replay = self._clone_module_to_gpu(self.embedding)
             emb_out = emb_replay(input_ids_gpu)
             emb_out.backward(grad_hidden)
+        self._drain_ready_grad_tasks()
         self._copy_module_grads_to_cpu_async(emb_replay, self.embedding)
         self._drain_grad_tasks(wait_all=True)
 
@@ -413,7 +446,8 @@ class FlowTrainTrainer:
                 param.requires_grad_(False)
             self._record_buffer_busy(layer_idx, layer_idx % 2)
         self._copy_layer_grads_to_cpu_async(layer_idx, gpu_layer)
-        self._drain_grad_tasks(wait_all=False)
+        self._drain_ready_grad_tasks()
+        self._drain_grad_tasks(wait_all=False, min_remaining=self.config.num_grad_slabs - 1)
         return next_grad_hidden, next_grad_v_first
 
     def _clone_module_to_gpu(self, module: nn.Module) -> nn.Module:
@@ -436,6 +470,8 @@ class FlowTrainTrainer:
             return self.activation_store.unpack(checkpoint, self.device)
 
     def _refresh_layer_flat(self, layer_idx: int) -> None:
+        if not self.layer_flat_dirty[layer_idx]:
+            return
         flat = self.layer_pinned_flats[layer_idx]
         offset = 0
         destinations = []
@@ -446,6 +482,7 @@ class FlowTrainTrainer:
             sources.append(param.detach().reshape(-1).to(dtype=self.config.dtype))
             offset += numel
         batched_copy_(destinations, sources)
+        self.layer_flat_dirty[layer_idx] = False
 
     def _layer_template_kind(self, layer_idx: int) -> str:
         return "first" if layer_idx == 0 else "regular"
@@ -472,7 +509,7 @@ class FlowTrainTrainer:
 
     def _prefetch_layer_async(self, layer_idx: int, buffer_idx: int) -> None:
         kind = self._layer_template_kind(layer_idx)
-        if self.template_layer_idx[buffer_idx].get(kind) == layer_idx:
+        if self.template_layer_idx[buffer_idx].get(kind) == layer_idx and not self.layer_flat_dirty[layer_idx]:
             return
         gpu_layer = self._ensure_layer_template(layer_idx, buffer_idx)
         self._refresh_layer_flat(layer_idx)
@@ -526,7 +563,8 @@ class FlowTrainTrainer:
         ]
         if not entries:
             return
-        if len(self._grad_tasks) >= self.config.num_grad_slabs:
+        self._reap_grad_accum_futures(wait_all=False)
+        if len(self._grad_tasks) + len(self._grad_accum_futures) >= self.config.num_grad_slabs:
             self._drain_grad_tasks(wait_all=False, min_remaining=self.config.num_grad_slabs - 1)
 
         shapes = [cpu_param.shape for _, cpu_param in entries]
@@ -553,14 +591,61 @@ class FlowTrainTrainer:
         self._grad_tasks.append((slab_idx, event, slab, [cpu for _, cpu in entries], shapes, numels, source_grads))
 
     def _drain_grad_tasks(self, wait_all: bool, min_remaining: int = 0) -> None:
+        if wait_all:
+            for task in self._grad_tasks:
+                self._submit_grad_task(task)
+            self._grad_tasks.clear()
+            self._reap_grad_accum_futures(wait_all=True)
+            return
+
+        self._drain_ready_grad_tasks()
+        self._reap_grad_accum_futures(wait_all=False)
         while self._grad_tasks and (wait_all or len(self._grad_tasks) > min_remaining):
-            slab_idx, event, slab, cpu_params, shapes, numels, _source_grads = self._grad_tasks.pop(0)
-            event.synchronize()
-            offset = 0
-            for cpu_param, shape, numel in zip(cpu_params, shapes, numels, strict=True):
-                grad = slab[offset : offset + numel].view(shape).to(dtype=cpu_param.dtype)
-                if cpu_param.grad is None:
-                    cpu_param.grad = torch.zeros_like(cpu_param)
-                cpu_param.grad.add_(grad)
-                offset += numel
-            self.grad_slab_free.put(slab_idx)
+            self._submit_grad_task(self._grad_tasks.pop(0))
+            self._reap_grad_accum_futures(wait_all=False, min_remaining=min_remaining)
+
+    def _drain_ready_grad_tasks(self) -> None:
+        if not self._grad_tasks:
+            return
+        pending = []
+        for task in self._grad_tasks:
+            slab_idx, event, slab, cpu_params, shapes, numels, _source_grads = task
+            if event.query():
+                self._submit_grad_task(task)
+            else:
+                pending.append(task)
+        self._grad_tasks = pending
+
+    def _submit_grad_task(self, task) -> None:
+        future = self.grad_accum_executor.submit(self._finish_grad_task, task)
+        self._grad_accum_futures.append(future)
+
+    def _finish_grad_task(self, task) -> None:
+        slab_idx, event, slab, cpu_params, shapes, numels, _source_grads = task
+        event.synchronize()
+        self._accumulate_grad_task(slab, cpu_params, numels)
+        self.grad_slab_free.put(slab_idx)
+
+    def _reap_grad_accum_futures(self, wait_all: bool, min_remaining: int | None = None) -> None:
+        pending = []
+        for future in self._grad_accum_futures:
+            if wait_all or future.done():
+                future.result()
+            else:
+                pending.append(future)
+        self._grad_accum_futures = pending
+        if min_remaining is None:
+            return
+        while not wait_all and len(self._grad_tasks) + len(self._grad_accum_futures) > min_remaining:
+            if not self._grad_accum_futures:
+                break
+            future = self._grad_accum_futures.pop(0)
+            future.result()
+
+    def _accumulate_grad_task(self, slab: torch.Tensor, cpu_params: list[torch.nn.Parameter], numels: list[int]) -> None:
+        grads = []
+        for cpu_param in cpu_params:
+            if cpu_param.grad is None:
+                cpu_param.grad = torch.zeros_like(cpu_param)
+            grads.append(cpu_param.grad)
+        accumulate_grad_slab_(grads, slab, numels)

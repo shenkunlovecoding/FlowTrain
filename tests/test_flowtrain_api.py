@@ -2,9 +2,32 @@ from __future__ import annotations
 
 import torch
 
-from flowtrain import CPUAdamW, CPUQRMuon, DeepSpeedCPUAdamW, FlowTrainConfig, RWKV7, RWKV7ActivationStore, RWKV7Config, make_optimizer
+from flowtrain import (
+    CPU8bitAdamW,
+    CPUAdamW,
+    CPUQRMuon,
+    DeepSpeedCPUAdamW,
+    FlowTrainConfig,
+    IGNORE_INDEX,
+    RWKV7,
+    RWKV7ActivationStore,
+    RWKV7Config,
+    RWKVTokenizerAdapter,
+    SFTDataCollator,
+    SFTJsonlDataset,
+    make_optimizer,
+)
+from flowtrain.cpu_accum import accumulate_grad_slab_
 from flowtrain.copy_ops import batched_copy_
 from flowtrain.estimator import RWKV7Size, estimate_rwkv7_batch_size, rwkv7_param_breakdown
+
+
+class _DummyTokenizer:
+    pad_token_id = 0
+    eos_token_id = 1
+
+    def encode(self, text: str, add_special_tokens: bool = False):
+        return [ord(ch) % 47 + 2 for ch in text]
 
 
 def test_public_rwkv7_torch_ref_forward_backward():
@@ -95,12 +118,62 @@ def test_make_optimizer_returns_deepspeed_cpu_adam_when_available():
     assert not torch.equal(before, model.head.weight.detach())
 
 
+def test_make_optimizer_returns_cpu_adamw8bit():
+    model = RWKV7(
+        RWKV7Config(
+            vocab_size=12,
+            n_layer=1,
+            n_embd=64,
+            ctx_len=8,
+            lora_rank_style="simplified",
+            backend="torch_ref",
+        )
+    )
+
+    # Force int8 state on every param so the assertion is independent of model size.
+    optimizer = make_optimizer(model, optimizer="adamw8bit", min_quantized_numel=0)
+    assert isinstance(optimizer, CPU8bitAdamW)
+
+    head_param = model.head.weight
+    head_param.grad = torch.ones_like(head_param)
+    before = head_param.detach().clone()
+    optimizer.step()
+    assert not torch.equal(before, head_param.detach())
+
+    # Large-param path produced int8 quantized state with an fp32 master.
+    state = optimizer.state[head_param]
+    assert state["q_exp_avg"].dtype == torch.int8
+    assert state["q_exp_avg_sq"].dtype == torch.int8
+    assert state["exp_avg_scale"].dtype == torch.float32
+    assert state["master"].dtype == torch.float32
+    assert "exp_avg" not in state
+
+    # Small-param fallback: a threshold above every param keeps fp32 state.
+    tiny_opt = make_optimizer(model, optimizer="adamw8bit", min_quantized_numel=10**9)
+    assert isinstance(tiny_opt, CPU8bitAdamW)
+    model.zero_grad()
+    head_param.grad = torch.ones_like(head_param)
+    tiny_opt.step()
+    tiny_state = tiny_opt.state[head_param]
+    assert tiny_state["exp_avg"].dtype == torch.float32
+    assert tiny_state["exp_avg_sq"].dtype == torch.float32
+    assert "q_exp_avg" not in tiny_state
+
+
 def test_batched_copy_cpu_roundtrip():
     destinations = [torch.zeros(2), torch.zeros(3)]
     sources = [torch.ones(2), torch.arange(3, dtype=torch.float32)]
     batched_copy_(destinations, sources)
     assert torch.equal(destinations[0], sources[0])
     assert torch.equal(destinations[1], sources[1])
+
+
+def test_accumulate_grad_slab_python_fallback():
+    grads = [torch.zeros(2, 2), torch.ones(3)]
+    slab = torch.arange(7, dtype=torch.bfloat16)
+    accumulate_grad_slab_(grads, slab, [4, 3], use_cpp=False)
+    assert torch.equal(grads[0], torch.arange(4, dtype=torch.float32).view(2, 2))
+    assert torch.equal(grads[1], torch.ones(3) + torch.arange(4, 7, dtype=torch.float32))
 
 
 def test_flowtrain_config_rejects_int8_without_cpu_offload():
@@ -161,6 +234,57 @@ def test_estimator_reports_positive_batch_for_tiny_model():
     assert store_inputs.cpu_per_sample_gb > estimate.cpu_per_sample_gb
     assert qr_muon.cpu_base_gb != estimate.cpu_base_gb
     assert deepspeed_adam.cpu_base_gb == estimate.cpu_base_gb
+
+
+def test_sft_jsonl_dataset_masks_prompt_and_collates(tmp_path):
+    path = tmp_path / "sft.jsonl"
+    path.write_text(
+        '{"prompt":"ab","completion":"cd"}\n'
+        '{"input_ids":[5,6,7],"labels":[-100,6,7]}\n',
+        encoding="utf-8",
+    )
+    tokenizer = _DummyTokenizer()
+    dataset = SFTJsonlDataset(path, tokenizer, max_length=16, mask_prompt=True)
+
+    first = dataset[0]
+    prompt_len = len(tokenizer.encode("ab", add_special_tokens=False))
+    assert first["labels"][:prompt_len].tolist() == [IGNORE_INDEX] * prompt_len
+    assert first["labels"][prompt_len:].tolist() == first["input_ids"][prompt_len:].tolist()
+    assert first["input_ids"][-1].item() == tokenizer.eos_token_id
+
+    second = dataset[1]
+    assert second["labels"].tolist() == [IGNORE_INDEX, 6, 7]
+
+    batch = SFTDataCollator(pad_token_id=tokenizer.pad_token_id)([first, second])
+    assert batch["input_ids"].shape[0] == 2
+    assert batch["input_ids"].shape == batch["labels"].shape
+    assert batch["input_ids"][1, -1].item() == tokenizer.pad_token_id
+    assert batch["labels"][1, -1].item() == IGNORE_INDEX
+
+
+def test_rwkv_tokenizer_adapter_matches_sft_interface():
+    try:
+        import pyrwkv_tokenizer  # noqa: F401
+    except ImportError:
+        import pytest
+
+        pytest.skip("pyrwkv_tokenizer not installed")
+
+    adapter = RWKVTokenizerAdapter()
+
+    # _tokenize() calls encode(text, add_special_tokens=False); the adapter must
+    # accept that kwarg even though the underlying tokenizer has no notion of it.
+    ids = adapter.encode("User: hi\n\nAssistant:", add_special_tokens=False)
+    assert isinstance(ids, list) and all(isinstance(i, int) for i in ids)
+    assert len(ids) > 0
+
+    # decode is the inverse of encode (round-trips through the RWKV tokenizer).
+    assert adapter.decode(ids) == "User: hi\n\nAssistant:"
+
+    assert len(adapter) == 65536
+    assert isinstance(adapter.pad_token_id, int)
+    assert adapter.pad_token_id == 0
+    assert adapter.eos_token_id is None
 
 
 def test_tilelang_time_mix_post_matches_torch_reference():
@@ -229,16 +353,57 @@ def test_tilelang_time_mix_shift_matches_torch_reference():
         assert rel < 0.01
 
 
+def test_tilelang_time_mix_shift_backward_matches_torch_reference():
+    if not torch.cuda.is_available():
+        return
+
+    from flowtrain.tilelang_time_mix import time_mix_shift_tilelang
+
+    batch, timesteps, channels = 2, 17, 128
+    torch.manual_seed(2)
+
+    def leaf(*shape):
+        return (torch.randn(*shape, device="cuda", dtype=torch.bfloat16) * 0.1).contiguous().requires_grad_(True)
+
+    x = leaf(batch, timesteps, channels)
+    params = tuple(leaf(1, 1, channels) for _ in range(6))
+    x_ref = x.detach().clone().requires_grad_(True)
+    params_ref = tuple(param.detach().clone().requires_grad_(True) for param in params)
+    grad_outs = tuple(
+        (torch.randn(batch, timesteps, channels, device="cuda", dtype=torch.bfloat16) * 0.1).contiguous()
+        for _ in range(6)
+    )
+
+    outs = time_mix_shift_tilelang(x, *params)
+    loss = sum((out.float() * grad.float()).sum() for out, grad in zip(outs, grad_outs, strict=True))
+    loss.backward()
+
+    shifted = torch.nn.ZeroPad2d((0, 0, 1, -1))(x_ref) - x_ref
+    refs = tuple((x_ref + shifted * param).bfloat16() for param in params_ref)
+    ref_loss = sum((out.float() * grad.float()).sum() for out, grad in zip(refs, grad_outs, strict=True))
+    ref_loss.backward()
+    torch.cuda.synchronize()
+
+    rel_x = (x.grad.float() - x_ref.grad.float()).norm().item() / max(x_ref.grad.float().norm().item(), 1e-9)
+    assert rel_x < 0.03
+    for grad, ref_grad in zip((param.grad for param in params), (param.grad for param in params_ref), strict=True):
+        rel = (grad.float() - ref_grad.float()).norm().item() / max(ref_grad.float().norm().item(), 1e-9)
+        assert rel < 0.03
+
+
 if __name__ == "__main__":
     test_public_rwkv7_torch_ref_forward_backward()
     test_make_optimizer_returns_cpu_adamw()
     test_make_optimizer_returns_cpu_qr_muon()
     test_make_optimizer_returns_deepspeed_cpu_adam_when_available()
+    test_make_optimizer_returns_cpu_adamw8bit()
     test_batched_copy_cpu_roundtrip()
+    test_accumulate_grad_slab_python_fallback()
     test_flowtrain_config_rejects_int8_without_cpu_offload()
     test_flowtrain_config_accepts_store_layer_inputs()
     test_activation_store_int8_roundtrip_cpu()
     test_estimator_reports_positive_batch_for_tiny_model()
     test_tilelang_time_mix_post_matches_torch_reference()
     test_tilelang_time_mix_shift_matches_torch_reference()
+    test_tilelang_time_mix_shift_backward_matches_torch_reference()
     print("smoke ok")

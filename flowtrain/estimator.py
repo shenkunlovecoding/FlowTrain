@@ -15,7 +15,7 @@ from .trainer import infer_rwkv7_config_from_state
 ActivationOffload = Literal["none", "cpu"]
 ActivationQuant = Literal["none", "int8"]
 ActivationStrategy = Literal["recompute", "store_layer_inputs"]
-OptimizerKind = Literal["adamw", "deepspeed_cpu_adam", "qr_muon"]
+OptimizerKind = Literal["adamw", "deepspeed_cpu_adam", "qr_muon", "adamw8bit"]
 
 
 def _checkpoint_state(raw: dict) -> dict[str, torch.Tensor]:
@@ -173,8 +173,8 @@ def estimate_rwkv7_batch_size(
         raise ValueError("activation_quant='int8' requires activation_offload='cpu'")
     if activation_strategy not in ("recompute", "store_layer_inputs"):
         raise ValueError("activation_strategy must be 'recompute' or 'store_layer_inputs'")
-    if optimizer not in ("adamw", "deepspeed_cpu_adam", "qr_muon"):
-        raise ValueError("optimizer must be 'adamw', 'deepspeed_cpu_adam', or 'qr_muon'")
+    if optimizer not in ("adamw", "deepspeed_cpu_adam", "qr_muon", "adamw8bit"):
+        raise ValueError("optimizer must be 'adamw', 'deepspeed_cpu_adam', 'qr_muon', or 'adamw8bit'")
 
     breakdown = rwkv7_param_breakdown(size)
     max_layer = max(breakdown.first_layer_params, breakdown.regular_layer_params)
@@ -220,11 +220,16 @@ def estimate_rwkv7_batch_size(
         )
         optimizer_assumption = "QR Muon states are used for RWKV block projection/LoRA matrices; other params use AdamW"
     else:
-        optimizer_state_bytes = breakdown.total_params * optimizer_state_bytes_per_param
-        if optimizer == "deepspeed_cpu_adam":
-            optimizer_assumption = "CPU params, CPU grads, and DeepSpeed CPUAdam states stay on host memory"
+        if optimizer == "adamw8bit":
+            bytes_per_param = 2
+            optimizer_assumption = "CPU params, CPU grads, and block-wise int8 AdamW states stay on host memory"
         else:
-            optimizer_assumption = "CPU params, CPU grads, and AdamW states stay on host memory"
+            bytes_per_param = optimizer_state_bytes_per_param
+            if optimizer == "deepspeed_cpu_adam":
+                optimizer_assumption = "CPU params, CPU grads, and DeepSpeed CPUAdam states stay on host memory"
+            else:
+                optimizer_assumption = "CPU params, CPU grads, and AdamW states stay on host memory"
+        optimizer_state_bytes = breakdown.total_params * bytes_per_param
 
     cpu_base_bytes = (
         breakdown.total_params * (param_dtype_bytes + param_dtype_bytes)

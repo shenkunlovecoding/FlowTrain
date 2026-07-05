@@ -1,6 +1,7 @@
 from .activation_store import RWKV7ActivationStore
-from .optimizer import CPUAdamW, CPUQRMuon, DeepSpeedCPUAdamW
+from .optimizer import CPU8bitAdamW, CPUAdamW, CPUQRMuon, DeepSpeedCPUAdamW
 from .rwkv7 import RWKV7, RWKV7Block, RWKV7Config, make_optimizer, rwkv7_recurrence
+from .sft_data import IGNORE_INDEX, RWKVTokenizerAdapter, SFTDataCollator, SFTJsonlDataset
 from .tilelang_recurrence import rwkv7_recurrence_tilelang
 from .trainer import FlowTrainConfig, FlowTrainTrainer, infer_rwkv7_config_from_state, load_rwkv7_checkpoint
 
@@ -13,7 +14,12 @@ __all__ = [
     "FlowTrainConfig",
     "FlowTrainTrainer",
     "RWKV7ActivationStore",
+    "SFTJsonlDataset",
+    "SFTDataCollator",
+    "RWKVTokenizerAdapter",
+    "IGNORE_INDEX",
     "CPUAdamW",
+    "CPU8bitAdamW",
     "CPUQRMuon",
     "DeepSpeedCPUAdamW",
     "infer_rwkv7_config_from_state",

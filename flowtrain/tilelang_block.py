@@ -156,8 +156,7 @@ def _time_mix_tilelang(att, x: torch.Tensor, v_first: torch.Tensor) -> tuple[tor
     h = att.n_head
     can_use_post, time_mix_post_tilelang, can_use_shift, time_mix_shift_tilelang = _tilelang_time_mix_post_ops()
     if (
-        not torch.is_grad_enabled()
-        and os.environ.get("FLOWTRAIN_DISABLE_TIMEMIX_SHIFT_FUSION") != "1"
+        os.environ.get("FLOWTRAIN_DISABLE_TIMEMIX_SHIFT_FUSION") != "1"
         and can_use_shift(x, att.x_r, att.x_w, att.x_k, att.x_v, att.x_a, att.x_g)
     ):
         xr, xw, xk, xv, xa, xg = time_mix_shift_tilelang(x, att.x_r, att.x_w, att.x_k, att.x_v, att.x_a, att.x_g)

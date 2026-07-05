@@ -14,6 +14,7 @@ setup(
     long_description=long_description,
     long_description_content_type="text/markdown",
     packages=find_packages(include=["flowtrain", "flowtrain.*"]),
+    package_data={"flowtrain": ["csrc/*.cpp"]},
     python_requires=">=3.10",
     install_requires=[
         "torch",
@@ -23,10 +24,12 @@ setup(
     ],
     extras_require={
         "deepspeed": ["deepspeed"],
+        "sft": ["transformers", "pyrwkv_tokenizer"],
     },
     entry_points={
         "console_scripts": [
             "flowtrain-train-rwkv7=flowtrain.cli.train_rwkv7:main",
+            "flowtrain-train-sft=flowtrain.cli.train_sft:main",
             "flowtrain-estimate-rwkv7-bs=flowtrain.cli.estimate_rwkv7_bs:main",
         ],
     },
