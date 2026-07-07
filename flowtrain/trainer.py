@@ -522,13 +522,14 @@ class FlowTrainTrainer:
                 )
             loss.backward()
             loss_value_tensor = loss.detach().float()
+            grad_hidden = hidden_before_norm.grad.detach()
+            grad_v_first = torch.zeros_like(final_v_first)
 
-        grad_hidden = hidden_before_norm.grad.detach()
-        grad_v_first = torch.zeros_like(final_v_first)
         self._copy_module_grads_to_cpu_async(head_gpu, self.head)
         self._copy_module_grads_to_cpu_async(norm_gpu, self.norm)
         self._drain_ready_grad_tasks()
 
+        torch.cuda.current_stream(self.device).wait_stream(self.compute_stream)
         loss_val = float(loss_value_tensor.cpu())
         del hidden_after_norm, hidden_before_norm, final_hidden, final_v_first, total_loss
 
