@@ -119,6 +119,23 @@ def test_make_optimizer_returns_deepspeed_cpu_adam_when_available():
     assert not torch.equal(before, model.head.weight.detach())
 
 
+def test_deepspeed_cpu_adam_uses_fp32_master_for_bf16_params():
+    try:
+        import deepspeed  # noqa: F401
+    except ImportError:
+        return
+
+    param = torch.nn.Parameter(torch.ones(8, dtype=torch.bfloat16))
+    optimizer = DeepSpeedCPUAdamW([param], lr=0.1, weight_decay=0.0)
+    assert optimizer.original_to_master[param].dtype == torch.float32
+    assert optimizer.optimizer.param_groups[0]["params"][0] is optimizer.original_to_master[param]
+    param.grad = torch.ones_like(param)
+    optimizer.step()
+    assert param.dtype == torch.bfloat16
+    assert torch.isfinite(param).all()
+    assert not torch.equal(param.detach(), torch.ones_like(param))
+
+
 def test_make_optimizer_returns_cpu_adamw8bit():
     model = RWKV7(
         RWKV7Config(

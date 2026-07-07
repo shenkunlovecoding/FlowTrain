@@ -259,7 +259,7 @@ class DeepSpeedCPUAdamW:
                 "optimizer='deepspeed_cpu_adam' requires deepspeed; install it or use optimizer='adamw'"
             ) from exc
 
-        groups = CPUAdamW(
+        original_groups = CPUAdamW(
             params,
             lr=lr,
             betas=betas,
@@ -268,24 +268,42 @@ class DeepSpeedCPUAdamW:
             max_grad_norm=max_grad_norm,
         ).param_groups
         self.max_grad_norm = max_grad_norm
+        self.original_param_groups = original_groups
+        self.original_to_master: dict[torch.nn.Parameter, torch.nn.Parameter] = {}
+        master_groups: list[dict[str, Any]] = []
+        for group in original_groups:
+            master_group = {key: value for key, value in group.items() if key != "params"}
+            master_params = []
+            for param in group["params"]:
+                master = torch.nn.Parameter(param.detach().float().cpu().clone(), requires_grad=True)
+                self.original_to_master[param] = master
+                master_params.append(master)
+            master_group["params"] = master_params
+            master_groups.append(master_group)
         self.optimizer = DeepSpeedCPUAdam(
-            groups,
+            master_groups,
             lr=lr,
             betas=betas,
             eps=eps,
             weight_decay=weight_decay,
         )
-        self.param_groups = self.optimizer.param_groups
+        self.param_groups = original_groups
 
     def zero_grad(self, set_to_none: bool = True) -> None:
         self.optimizer.zero_grad(set_to_none=set_to_none)
+        for group in self.original_param_groups:
+            for param in group["params"]:
+                if set_to_none:
+                    param.grad = None
+                elif param.grad is not None:
+                    param.grad.zero_()
 
     def clip_gradients(self) -> float:
         if self.max_grad_norm is None or self.max_grad_norm <= 0:
             return 0.0
         params_with_grad = [
             param
-            for group in self.param_groups
+            for group in self.original_param_groups
             for param in group["params"]
             if param.grad is not None
         ]
@@ -304,7 +322,18 @@ class DeepSpeedCPUAdamW:
     @torch.no_grad()
     def step(self) -> float:
         grad_norm = self.clip_gradients()
+        for group in self.original_param_groups:
+            for param in group["params"]:
+                master = self.original_to_master[param]
+                if param.grad is None:
+                    master.grad = None
+                else:
+                    master.grad = param.grad.detach().float().cpu()
         self.optimizer.step()
+        for group in self.original_param_groups:
+            for param in group["params"]:
+                master = self.original_to_master[param]
+                param.data.copy_(master.data.to(dtype=param.dtype))
         return grad_norm
 
     def state_dict(self) -> dict[str, Any]:
