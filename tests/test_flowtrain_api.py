@@ -71,6 +71,54 @@ def test_make_optimizer_returns_cpu_adamw():
     assert not torch.equal(before, model.head.weight.detach())
 
 
+def test_cpu_adamw_cpp_matches_python_fallback():
+    import os
+    import pytest
+
+    original_disable = os.environ.get("FLOWTRAIN_DISABLE_CPU_ADAMW8BIT_CPP")
+    os.environ.pop("FLOWTRAIN_DISABLE_CPU_ADAMW8BIT_CPP", None)
+    _load_adamw8bit_extension.cache_clear()
+    if _load_adamw8bit_extension() is None:
+        pytest.skip("CPU AdamW C++ extension is unavailable")
+
+    torch.manual_seed(7)
+    initial = torch.randn(4096, dtype=torch.float32)
+    grads = [torch.randn_like(initial) for _ in range(3)]
+
+    def run(*, disable_cpp: bool):
+        if disable_cpp:
+            os.environ["FLOWTRAIN_DISABLE_CPU_ADAMW8BIT_CPP"] = "1"
+        else:
+            os.environ.pop("FLOWTRAIN_DISABLE_CPU_ADAMW8BIT_CPP", None)
+        _load_adamw8bit_extension.cache_clear()
+
+        param = torch.nn.Parameter(initial.clone())
+        optimizer = CPUAdamW([param], lr=1e-3, weight_decay=0.01, max_grad_norm=None)
+        for grad in grads:
+            param.grad = grad.clone()
+            optimizer.step()
+        state = optimizer.state[param]
+        return (
+            param.detach().clone(),
+            state["master"].clone(),
+            state["exp_avg"].clone(),
+            state["exp_avg_sq"].clone(),
+        )
+
+    try:
+        cpp = run(disable_cpp=False)
+        fallback = run(disable_cpp=True)
+    finally:
+        if original_disable is None:
+            os.environ.pop("FLOWTRAIN_DISABLE_CPU_ADAMW8BIT_CPP", None)
+        else:
+            os.environ["FLOWTRAIN_DISABLE_CPU_ADAMW8BIT_CPP"] = original_disable
+        _load_adamw8bit_extension.cache_clear()
+
+    for actual, expected in zip(cpp, fallback, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=3e-7)
+
+
 def test_make_optimizer_returns_cpu_qr_muon():
     model = RWKV7(
         RWKV7Config(

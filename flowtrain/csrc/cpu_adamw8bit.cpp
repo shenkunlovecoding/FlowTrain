@@ -40,6 +40,60 @@ int8_t quantize_nonnegative(float value, float scale) {
 }
 
 template <typename param_t, typename grad_t>
+void adamw_step_impl(
+    torch::Tensor master,
+    torch::Tensor param,
+    torch::Tensor grad,
+    torch::Tensor exp_avg,
+    torch::Tensor exp_avg_sq,
+    double lr,
+    double beta1,
+    double beta2,
+    double eps,
+    double weight_decay,
+    int64_t step) {
+  const int64_t numel = master.numel();
+
+  float* master_data = master.data_ptr<float>();
+  param_t* param_data = param.data_ptr<param_t>();
+  const grad_t* grad_data = grad.data_ptr<grad_t>();
+  float* m_data = exp_avg.data_ptr<float>();
+  float* v_data = exp_avg_sq.data_ptr<float>();
+
+  const float lr_f = static_cast<float>(lr);
+  const float beta1_f = static_cast<float>(beta1);
+  const float beta2_f = static_cast<float>(beta2);
+  const float eps_f = static_cast<float>(eps);
+  const float weight_decay_f = static_cast<float>(weight_decay);
+  const float one_minus_beta1 = 1.0F - beta1_f;
+  const float one_minus_beta2 = 1.0F - beta2_f;
+  const float decay = 1.0F - lr_f * weight_decay_f;
+  const float bias_correction1 = 1.0F - static_cast<float>(std::pow(beta1, static_cast<double>(step)));
+  const float bias_correction2 = 1.0F - static_cast<float>(std::pow(beta2, static_cast<double>(step)));
+  const float step_size = lr_f * std::sqrt(bias_correction2) / bias_correction1;
+
+#pragma omp parallel for schedule(static)
+  for (int64_t idx = 0; idx < numel; ++idx) {
+    const float g = static_cast<float>(grad_data[idx]);
+    float w = master_data[idx];
+    float m = m_data[idx];
+    float v = v_data[idx];
+
+    if (weight_decay_f != 0.0F) {
+      w *= decay;
+    }
+    m = m * beta1_f + g * one_minus_beta1;
+    v = v * beta2_f + g * g * one_minus_beta2;
+    w += -step_size * m / (std::sqrt(v) + eps_f);
+
+    master_data[idx] = w;
+    m_data[idx] = m;
+    v_data[idx] = v;
+    param_data[idx] = static_cast<param_t>(w);
+  }
+}
+
+template <typename param_t, typename grad_t>
 void adamw8bit_step_impl(
     torch::Tensor master,
     torch::Tensor param,
@@ -137,6 +191,56 @@ void adamw8bit_step_impl(
 
 }  // namespace
 
+void adamw_step(
+    torch::Tensor master,
+    torch::Tensor param,
+    torch::Tensor grad,
+    torch::Tensor exp_avg,
+    torch::Tensor exp_avg_sq,
+    double lr,
+    double beta1,
+    double beta2,
+    double eps,
+    double weight_decay,
+    int64_t step) {
+  check_cpu_contiguous(master, "master");
+  check_cpu_contiguous(param, "param");
+  check_cpu_contiguous(grad, "grad");
+  check_cpu_contiguous(exp_avg, "exp_avg");
+  check_cpu_contiguous(exp_avg_sq, "exp_avg_sq");
+  if (master.scalar_type() != torch::kFloat32) {
+    throw std::runtime_error("master must be float32");
+  }
+  if (exp_avg.scalar_type() != torch::kFloat32 || exp_avg_sq.scalar_type() != torch::kFloat32) {
+    throw std::runtime_error("AdamW moments must be float32");
+  }
+  if (param.numel() != master.numel() || grad.numel() != master.numel() ||
+      exp_avg.numel() != master.numel() || exp_avg_sq.numel() != master.numel()) {
+    throw std::runtime_error("AdamW tensors must have matching numel");
+  }
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::kBFloat16, at::kHalf, param.scalar_type(), "adamw_step_param", [&] {
+        using param_t = scalar_t;
+        AT_DISPATCH_FLOATING_TYPES_AND2(
+            at::kBFloat16, at::kHalf, grad.scalar_type(), "adamw_step_grad", [&] {
+              using grad_t = scalar_t;
+              adamw_step_impl<param_t, grad_t>(
+                  master,
+                  param,
+                  grad,
+                  exp_avg,
+                  exp_avg_sq,
+                  lr,
+                  beta1,
+                  beta2,
+                  eps,
+                  weight_decay,
+                  step);
+            });
+      });
+}
+
 void adamw8bit_step(
     torch::Tensor master,
     torch::Tensor param,
@@ -208,5 +312,6 @@ void adamw8bit_step(
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("adamw_step", &adamw_step, "Fused fp32-state CPU AdamW step");
   m.def("adamw8bit_step", &adamw8bit_step, "Fused block-wise int8 CPU AdamW step");
 }

@@ -6,7 +6,7 @@ from typing import Any
 
 import torch
 
-from .cpu_adamw8bit import adamw8bit_step_
+from .cpu_adamw8bit import adamw8bit_step_, adamw_step_
 
 
 _INT8_MAX = 127.0
@@ -194,7 +194,23 @@ class CPUAdamW:
                 assert isinstance(exp_avg, torch.Tensor)
                 assert isinstance(exp_avg_sq, torch.Tensor)
 
-                grad = param.grad.detach().float().cpu()
+                grad_raw = param.grad.detach()
+                if adamw_step_(
+                    master,
+                    param.data,
+                    grad_raw,
+                    exp_avg,
+                    exp_avg_sq,
+                    lr=lr,
+                    beta1=float(beta1),
+                    beta2=float(beta2),
+                    eps=eps,
+                    weight_decay=weight_decay,
+                    step=step,
+                ):
+                    continue
+
+                grad = grad_raw.float().cpu()
                 if weight_decay != 0:
                     master.mul_(1.0 - lr * weight_decay)
 
@@ -771,7 +787,26 @@ class CPU8bitAdamW(CPUAdamW):
         assert isinstance(master, torch.Tensor)
         assert isinstance(exp_avg, torch.Tensor)
         assert isinstance(exp_avg_sq, torch.Tensor)
-        grad = param.grad.detach().float().cpu()
+        grad_raw = param.grad.detach()
+        if (
+            not self.debug_finite_checks
+            and adamw_step_(
+                master,
+                param.data,
+                grad_raw,
+                exp_avg,
+                exp_avg_sq,
+                lr=float(group["lr"]),
+                beta1=float(group["betas"][0]),
+                beta2=float(group["betas"][1]),
+                eps=float(group["eps"]),
+                weight_decay=float(group["weight_decay"]),
+                step=step,
+            )
+        ):
+            return
+
+        grad = grad_raw.float().cpu()
         if self.debug_finite_checks:
             self._check_grad(name, grad)
         self._adamw_update(

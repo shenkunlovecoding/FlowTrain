@@ -9,6 +9,63 @@ import torch
 from torch.utils.cpp_extension import load
 
 
+def adamw_step_(
+    master: torch.Tensor,
+    param: torch.Tensor,
+    grad: torch.Tensor,
+    exp_avg: torch.Tensor,
+    exp_avg_sq: torch.Tensor,
+    *,
+    lr: float,
+    beta1: float,
+    beta2: float,
+    eps: float,
+    weight_decay: float,
+    step: int,
+    use_cpp: bool = True,
+) -> bool:
+    """Run the fused fp32-state AdamW update if the optional C++ extension is available."""
+
+    if not use_cpp:
+        return False
+    if master.numel() < 4096:
+        return False
+    if not (
+        master.is_cpu
+        and param.is_cpu
+        and grad.is_cpu
+        and exp_avg.is_cpu
+        and exp_avg_sq.is_cpu
+    ):
+        return False
+    if not (
+        master.is_contiguous()
+        and param.is_contiguous()
+        and grad.is_contiguous()
+        and exp_avg.is_contiguous()
+        and exp_avg_sq.is_contiguous()
+    ):
+        return False
+
+    extension = _load_extension()
+    if extension is None:
+        return False
+    extension.adamw_step(
+        master,
+        param,
+        grad,
+        exp_avg,
+        exp_avg_sq,
+        float(lr),
+        float(beta1),
+        float(beta2),
+        float(eps),
+        float(weight_decay),
+        int(step),
+    )
+    return True
+
+
 def adamw8bit_step_(
     master: torch.Tensor,
     param: torch.Tensor,
