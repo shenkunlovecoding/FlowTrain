@@ -6,6 +6,8 @@ from typing import Any
 
 import torch
 
+from .cpu_adamw8bit import adamw8bit_step_
+
 
 _INT8_MAX = 127.0
 
@@ -35,6 +37,26 @@ def _quantize_int8_blockwise(
     # leaves the zeros untouched after round-trip.
     scale = torch.where(scale > 0, scale, torch.ones_like(scale))
     q = torch.round(blocks / scale.unsqueeze(1)).clamp_(-_INT8_MAX, _INT8_MAX).to(torch.int8)
+    return q, scale.to(torch.float32), padded_numel
+
+
+def _quantize_nonnegative_int8_blockwise(
+    tensor: torch.Tensor, block_size: int = 256
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Quantize non-negative values without rounding positive entries to zero."""
+    if block_size < 1:
+        raise ValueError("block_size must be >= 1")
+    flat = tensor.detach().to(device="cpu", dtype=torch.float32).clamp_min_(0).flatten()
+    numel = flat.numel()
+    padded_numel = numel + (-numel) % block_size
+    if padded_numel != numel:
+        flat = torch.nn.functional.pad(flat, (0, padded_numel - numel))
+    blocks = flat.view(-1, block_size)
+    absmax = blocks.amax(dim=1)
+    scale = absmax / _INT8_MAX
+    scale = torch.where(scale > 0, scale, torch.ones_like(scale))
+    rounded = torch.round(blocks / scale.unsqueeze(1)).clamp_(0, _INT8_MAX)
+    q = torch.where(blocks > 0, rounded.clamp_min(1), rounded).to(torch.int8)
     return q, scale.to(torch.float32), padded_numel
 
 
@@ -517,7 +539,11 @@ class CPU8bitAdamW(CPUAdamW):
         max_grad_norm: float | None = 1.0,
         block_size: int = 256,
         min_quantized_numel: int = 4096,
+        debug_finite_checks: bool = False,
+        param_names: dict[torch.nn.Parameter, str] | None = None,
     ):
+        self.debug_finite_checks = debug_finite_checks
+        self.param_names = param_names or {}
         super().__init__(
             params,
             lr=lr,
@@ -532,6 +558,48 @@ class CPU8bitAdamW(CPUAdamW):
             raise ValueError("min_quantized_numel must be >= 0")
         self.block_size = int(block_size)
         self.min_quantized_numel = int(min_quantized_numel)
+
+    def _name_for(self, param: torch.nn.Parameter) -> str:
+        return self.param_names.get(param, f"param@{id(param):x}")
+
+    def _check_grad(self, name: str, grad: torch.Tensor) -> None:
+        if torch.isfinite(grad).all():
+            return
+        print("[NONFINITE GRAD]", name, grad.dtype, grad.shape)
+        raise RuntimeError("non-finite grad")
+
+    def _check_dequantized_moments(self, name: str, exp_avg: torch.Tensor, exp_avg_sq: torch.Tensor) -> None:
+        if not torch.isfinite(exp_avg).all():
+            print("[NONFINITE M]", name)
+            raise RuntimeError("non-finite m")
+        if not torch.isfinite(exp_avg_sq).all():
+            print("[NONFINITE V]", name)
+            raise RuntimeError("non-finite v")
+        if (exp_avg_sq < 0).any():
+            print("[NEGATIVE V]", name, exp_avg_sq.min().item())
+            raise RuntimeError("negative second moment")
+
+    def _check_update(
+        self,
+        name: str,
+        exp_avg: torch.Tensor,
+        exp_avg_sq: torch.Tensor,
+        denom: torch.Tensor,
+        update: torch.Tensor,
+    ) -> None:
+        if torch.isfinite(update).all():
+            return
+        print("[NONFINITE UPDATE]", name)
+        print("m", exp_avg.min().item(), exp_avg.max().item())
+        print("v", exp_avg_sq.min().item(), exp_avg_sq.max().item())
+        print("denom", denom.min().item(), denom.max().item())
+        raise RuntimeError("non-finite update")
+
+    def _check_param_after_opt(self, name: str, param: torch.nn.Parameter) -> None:
+        if torch.isfinite(param.data).all():
+            return
+        print("[NONFINITE PARAM AFTER OPT]", name)
+        raise RuntimeError("non-finite param after opt")
 
     def _should_quantize(self, param: torch.nn.Parameter) -> bool:
         return param.numel() >= self.min_quantized_numel
@@ -573,6 +641,7 @@ class CPU8bitAdamW(CPUAdamW):
         eps: float,
         weight_decay: float,
         step: int,
+        debug_name: str | None = None,
     ) -> None:
         if weight_decay != 0:
             master.mul_(1.0 - lr * weight_decay)
@@ -581,10 +650,17 @@ class CPU8bitAdamW(CPUAdamW):
         bias_correction1 = 1.0 - beta1**step
         bias_correction2 = 1.0 - beta2**step
         step_size = lr * math.sqrt(bias_correction2) / bias_correction1
-        denom = exp_avg_sq.sqrt().add_(eps)
-        master.addcdiv_(exp_avg, denom, value=-step_size)
+        if self.debug_finite_checks and debug_name is not None:
+            denom = exp_avg_sq.clamp_min(0).sqrt().add_(eps)
+            update = exp_avg / denom
+            self._check_update(debug_name, exp_avg, exp_avg_sq, denom, update)
+            master.add_(update, alpha=-step_size)
+        else:
+            denom = exp_avg_sq.sqrt().add_(eps)
+            master.addcdiv_(exp_avg, denom, value=-step_size)
 
     def _step_quantized(self, param: torch.nn.Parameter, group: dict[str, Any]) -> None:
+        name = self._name_for(param)
         state = self._state_for(param)
         state["step"] = int(state["step"]) + 1
         step = int(state["step"])
@@ -599,7 +675,31 @@ class CPU8bitAdamW(CPUAdamW):
         assert isinstance(q_exp_avg_sq, torch.Tensor)
         assert isinstance(exp_avg_sq_scale, torch.Tensor)
 
-        grad = param.grad.detach().float().cpu()
+        grad_raw = param.grad.detach()
+        if (
+            not self.debug_finite_checks
+            and adamw8bit_step_(
+                master,
+                param.data,
+                grad_raw,
+                q_exp_avg,
+                exp_avg_scale,
+                q_exp_avg_sq,
+                exp_avg_sq_scale,
+                lr=float(group["lr"]),
+                beta1=float(group["betas"][0]),
+                beta2=float(group["betas"][1]),
+                eps=float(group["eps"]),
+                weight_decay=float(group["weight_decay"]),
+                step=step,
+                block_size=self.block_size,
+            )
+        ):
+            return
+
+        grad = grad_raw.float().cpu()
+        if self.debug_finite_checks:
+            self._check_grad(name, grad)
         # Dequantize into transient fp32 buffers for the update math, then
         # requantize so steady-state state stays int8.
         exp_avg = _dequantize_int8_blockwise(
@@ -608,6 +708,8 @@ class CPU8bitAdamW(CPUAdamW):
         exp_avg_sq = _dequantize_int8_blockwise(
             q_exp_avg_sq.view(-1, self.block_size), exp_avg_sq_scale, param.shape
         )
+        if self.debug_finite_checks:
+            self._check_dequantized_moments(name, exp_avg, exp_avg_sq)
         self._adamw_update(
             master,
             exp_avg,
@@ -619,12 +721,18 @@ class CPU8bitAdamW(CPUAdamW):
             float(group["eps"]),
             float(group["weight_decay"]),
             step,
+            debug_name=name,
         )
         state["q_exp_avg"], state["exp_avg_scale"], _ = _quantize_int8_blockwise(exp_avg, self.block_size)
-        state["q_exp_avg_sq"], state["exp_avg_sq_scale"], _ = _quantize_int8_blockwise(exp_avg_sq, self.block_size)
+        state["q_exp_avg_sq"], state["exp_avg_sq_scale"], _ = _quantize_nonnegative_int8_blockwise(
+            exp_avg_sq, self.block_size
+        )
         param.data.copy_(master.to(dtype=param.dtype))
+        if self.debug_finite_checks:
+            self._check_param_after_opt(name, param)
 
     def _step_fp32(self, param: torch.nn.Parameter, group: dict[str, Any]) -> None:
+        name = self._name_for(param)
         state = self._state_for(param)
         state["step"] = int(state["step"]) + 1
         step = int(state["step"])
@@ -635,6 +743,8 @@ class CPU8bitAdamW(CPUAdamW):
         assert isinstance(exp_avg, torch.Tensor)
         assert isinstance(exp_avg_sq, torch.Tensor)
         grad = param.grad.detach().float().cpu()
+        if self.debug_finite_checks:
+            self._check_grad(name, grad)
         self._adamw_update(
             master,
             exp_avg,
@@ -646,8 +756,11 @@ class CPU8bitAdamW(CPUAdamW):
             float(group["eps"]),
             float(group["weight_decay"]),
             step,
+            debug_name=name,
         )
         param.data.copy_(master.to(dtype=param.dtype))
+        if self.debug_finite_checks:
+            self._check_param_after_opt(name, param)
 
     @torch.no_grad()
     def step(self) -> float:

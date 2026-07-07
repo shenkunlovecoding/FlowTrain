@@ -198,7 +198,7 @@ def estimate_rwkv7_batch_size(
         else:
             n_checkpoints = math.ceil(size.n_layer / checkpoint_interval) + 1
         if activation_quant == "int8":
-            packed_tensor_bytes = seq_len * (size.n_embd + 2)
+            packed_tensor_bytes = seq_len * (size.n_embd + 4)
         else:
             packed_tensor_bytes = token_hidden_bytes
         cpu_activation_per_sample_bytes = (n_checkpoints + 1) * packed_tensor_bytes

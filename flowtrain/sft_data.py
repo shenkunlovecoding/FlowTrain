@@ -47,6 +47,18 @@ def _truncate_pair(input_ids: list[int], labels: list[int], max_length: int | No
     return input_ids[:max_length], labels[:max_length]
 
 
+def _pad_length_to_bucket(length: int, buckets: Sequence[int]) -> int:
+    bucket_values = [int(bucket) for bucket in buckets]
+    if any(bucket <= 0 for bucket in bucket_values):
+        raise ValueError("pad_to_buckets values must be positive")
+    if bucket_values != sorted(set(bucket_values)):
+        raise ValueError("pad_to_buckets values must be strictly increasing")
+    for bucket in bucket_values:
+        if length <= bucket:
+            return bucket
+    return length
+
+
 class RWKVTokenizerAdapter:
     """Expose ``pyrwkv_tokenizer.RWKVTokenizer`` through the small tokenizer
     interface that :class:`SFTJsonlDataset` consumes via :func:`_tokenize`
@@ -190,16 +202,29 @@ class SFTDataCollator:
     label_pad_token_id: int = IGNORE_INDEX
     max_length: int | None = None
     pad_to_multiple_of: int | None = None
+    pad_to_buckets: Sequence[int] | None = None
+    pad_to_max_length: bool = False
 
     def __call__(self, features: Sequence[Mapping[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
         if not features:
             raise ValueError("features must not be empty")
-        max_len = max(int(feature["input_ids"].numel()) for feature in features)
-        if self.max_length is not None:
-            max_len = min(max_len, self.max_length)
+        if self.pad_to_max_length:
+            if self.max_length is None:
+                raise ValueError("pad_to_max_length requires max_length")
+            max_len = self.max_length
+        else:
+            max_len = max(int(feature["input_ids"].numel()) for feature in features)
+            if self.max_length is not None:
+                max_len = min(max_len, self.max_length)
+        if self.pad_to_buckets:
+            max_len = _pad_length_to_bucket(max_len, self.pad_to_buckets)
+            if self.max_length is not None:
+                max_len = min(max_len, self.max_length)
         if self.pad_to_multiple_of:
             multiple = self.pad_to_multiple_of
             max_len = ((max_len + multiple - 1) // multiple) * multiple
+            if self.max_length is not None:
+                max_len = min(max_len, self.max_length)
 
         input_rows: list[torch.Tensor] = []
         label_rows: list[torch.Tensor] = []

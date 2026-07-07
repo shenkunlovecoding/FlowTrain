@@ -150,9 +150,9 @@ class RWKV7ActivationStore:
         quantized = torch.clamp(torch.round(values / scale), -127, 127).to(torch.int8)
 
         q_cpu = _empty_cpu(quantized.shape, torch.int8, pin_memory=tensor.is_cuda)
-        s_cpu = _empty_cpu(scale.shape, torch.float16, pin_memory=tensor.is_cuda)
+        s_cpu = _empty_cpu(scale.shape, torch.float32, pin_memory=tensor.is_cuda)
         q_cpu.copy_(quantized, non_blocking=tensor.is_cuda)
-        s_cpu.copy_(scale.to(torch.float16), non_blocking=tensor.is_cuda)
+        s_cpu.copy_(scale, non_blocking=tensor.is_cuda)
         if tensor.is_cuda:
             quantized.record_stream(torch.cuda.current_stream(tensor.device))
             scale.record_stream(torch.cuda.current_stream(tensor.device))

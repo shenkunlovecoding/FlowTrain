@@ -34,6 +34,7 @@ class FlowTrainConfig:
     activation_strategy: Literal["recompute", "store_layer_inputs"] = "recompute"
     max_grad_norm: float | None = 1.0
     logit_chunk_size: int = 128
+    debug_finite_checks: bool = False
 
     def __post_init__(self) -> None:
         if self.backend not in ("tilelang", "torch_ref"):
@@ -73,6 +74,24 @@ def _pin_empty(numel: int, dtype: torch.dtype) -> torch.Tensor:
         return torch.empty(numel, dtype=dtype, device="cpu", pin_memory=True)
     except RuntimeError:
         return torch.empty(numel, dtype=dtype, device="cpu")
+
+
+def _raise_if_nonfinite(name: str, tensor: torch.Tensor) -> None:
+    if torch.isfinite(tensor).all():
+        return
+    finite_mask = torch.isfinite(tensor)
+    bad = int((~finite_mask).sum().item())
+    finite = tensor.detach()[finite_mask]
+    if finite.numel():
+        min_val = float(finite.min().item())
+        max_val = float(finite.max().item())
+        range_text = f" finite_min={min_val:.6g} finite_max={max_val:.6g}"
+    else:
+        range_text = " no_finite_values"
+    raise RuntimeError(
+        f"non-finite tensor: {name} bad={bad} shape={tuple(tensor.shape)} "
+        f"dtype={tensor.dtype} device={tensor.device}{range_text}"
+    )
 
 
 def infer_rwkv7_config_from_state(
@@ -189,6 +208,7 @@ class FlowTrainTrainer:
 
         model.config.backend = config.backend
         model.config.chunk_len = config.chunk_len
+        model.config.debug_finite_checks = config.debug_finite_checks
         if model.config.head_size != 64:
             raise ValueError("FlowTrain v1 supports RWKV-7 head_size=64 only")
         self.model = model.cpu()
@@ -248,6 +268,15 @@ class FlowTrainTrainer:
         for param in self.model.parameters():
             param.grad = None
 
+    def check_finite_parameters(self, stage: str) -> None:
+        for name, param in self.model.named_parameters():
+            _raise_if_nonfinite(f"{stage}:param:{name}", param.data)
+
+    def check_finite_gradients(self, stage: str) -> None:
+        for name, param in self.model.named_parameters():
+            if param.grad is not None:
+                _raise_if_nonfinite(f"{stage}:grad:{name}", param.grad)
+
     def cleanup(self) -> None:
         self._drain_grad_tasks(wait_all=True)
         self.grad_accum_executor.shutdown(wait=True)
@@ -287,6 +316,8 @@ class FlowTrainTrainer:
             labels_gpu = labels.to(self.device, non_blocking=True)
             emb_gpu = self._clone_module_to_gpu(self.embedding)
             hidden = emb_gpu(input_ids_gpu)
+            if self.config.debug_finite_checks:
+                _raise_if_nonfinite("embedding", hidden)
             v_first = torch.empty_like(hidden)
 
         checkpoints = {}
@@ -306,6 +337,9 @@ class FlowTrainTrainer:
                 gpu_layer = self._wait_for_layer(layer_idx, buffer_idx)
                 with torch.cuda.stream(self.compute_stream):
                     hidden, v_first = gpu_layer(hidden, v_first)
+                    if self.config.debug_finite_checks:
+                        _raise_if_nonfinite(f"forward_layer_{layer_idx}:hidden", hidden)
+                        _raise_if_nonfinite(f"forward_layer_{layer_idx}:v_first", v_first)
                     self._record_buffer_busy(layer_idx, buffer_idx)
                 if layer_idx == 0:
                     self._save_v_first(v_first)
@@ -315,6 +349,11 @@ class FlowTrainTrainer:
         fwd_end = time.perf_counter()
 
         final_hidden, final_v_first = self._unpack_activation(checkpoints[len(self.layers)])
+        if self.config.debug_finite_checks:
+            with torch.cuda.stream(self.compute_stream):
+                _raise_if_nonfinite("final_hidden_unpacked", final_hidden)
+                if self.layers:
+                    _raise_if_nonfinite("final_v_first_unpacked", final_v_first)
         valid_tokens = int((labels[:, 1:] != -100).sum().item())
         if valid_tokens == 0:
             raise ValueError("labels contain no valid next-token targets")
@@ -324,14 +363,20 @@ class FlowTrainTrainer:
             norm_gpu = self._clone_module_to_gpu(self.norm)
             head_gpu = self._clone_module_to_gpu(self.head)
             hidden_after_norm = norm_gpu(hidden_before_norm)
+            if self.config.debug_finite_checks:
+                _raise_if_nonfinite("hidden_before_head", hidden_after_norm)
             total_loss = torch.zeros((), device=self.device, dtype=torch.float32)
             for start_t in range(0, input_ids.shape[1] - 1, self.config.logit_chunk_size):
                 end_t = min(start_t + self.config.logit_chunk_size, input_ids.shape[1] - 1)
                 logits = head_gpu(hidden_after_norm[:, start_t:end_t, :]).reshape(-1, self.vocab_size).float()
+                if self.config.debug_finite_checks:
+                    _raise_if_nonfinite(f"logits[{start_t}:{end_t}]", logits)
                 targets = labels_gpu[:, start_t + 1 : end_t + 1].reshape(-1)
                 total_loss = total_loss + F.cross_entropy(logits, targets, ignore_index=-100, reduction="sum")
                 del logits
             loss = total_loss / valid_tokens
+            if self.config.debug_finite_checks:
+                _raise_if_nonfinite("loss", loss)
             loss.backward()
             loss_value_tensor = loss.detach().float()
 
@@ -403,6 +448,8 @@ class FlowTrainTrainer:
 
         if self.config.max_grad_norm is not None and self.config.max_grad_norm > 0:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+        if self.config.debug_finite_checks:
+            self.check_finite_gradients("after_backward")
 
         torch.cuda.synchronize(self.device)
         bwd_end = time.perf_counter()

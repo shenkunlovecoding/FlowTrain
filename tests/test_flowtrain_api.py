@@ -18,6 +18,7 @@ from flowtrain import (
     make_optimizer,
 )
 from flowtrain.cpu_accum import accumulate_grad_slab_
+from flowtrain.cpu_adamw8bit import _load_extension as _load_adamw8bit_extension
 from flowtrain.copy_ops import batched_copy_
 from flowtrain.estimator import RWKV7Size, estimate_rwkv7_batch_size, rwkv7_param_breakdown
 
@@ -160,6 +161,104 @@ def test_make_optimizer_returns_cpu_adamw8bit():
     assert "q_exp_avg" not in tiny_state
 
 
+def test_cpu_adamw8bit_debug_checks_negative_second_moment():
+    import pytest
+
+    param = torch.nn.Parameter(torch.ones(8))
+    optimizer = CPU8bitAdamW(
+        [{"params": [param], "names": ["weight"]}],
+        lr=1e-3,
+        min_quantized_numel=0,
+        block_size=8,
+        debug_finite_checks=True,
+    )
+    param.grad = torch.ones_like(param)
+    optimizer.step()
+
+    state = optimizer.state[param]
+    state["q_exp_avg_sq"].fill_(-1)
+    state["exp_avg_sq_scale"].fill_(1.0)
+    param.grad = torch.ones_like(param)
+    with pytest.raises(RuntimeError, match="negative second moment"):
+        optimizer.step()
+
+
+def test_cpu_adamw8bit_keeps_positive_second_moment_nonzero():
+    param = torch.nn.Parameter(torch.zeros(256))
+    optimizer = CPU8bitAdamW([param], lr=0.0, min_quantized_numel=0, block_size=256)
+    grad = torch.zeros_like(param)
+    grad[0] = 1e-3
+    grad[1] = 1.0
+    param.grad = grad
+    optimizer.step()
+
+    state = optimizer.state[param]
+    q_exp_avg_sq = state["q_exp_avg_sq"].view(-1)
+    assert q_exp_avg_sq[0].item() > 0
+    assert q_exp_avg_sq[1].item() > 0
+    assert q_exp_avg_sq[2:].abs().sum().item() == 0
+
+
+def test_cpu_adamw8bit_cpp_matches_python_fallback():
+    import os
+    import pytest
+
+    original_disable = os.environ.get("FLOWTRAIN_DISABLE_CPU_ADAMW8BIT_CPP")
+    os.environ.pop("FLOWTRAIN_DISABLE_CPU_ADAMW8BIT_CPP", None)
+    _load_adamw8bit_extension.cache_clear()
+    if _load_adamw8bit_extension() is None:
+        pytest.skip("CPU AdamW8bit C++ extension is unavailable")
+
+    torch.manual_seed(0)
+    initial = torch.randn(1031, dtype=torch.float32)
+    grads = [torch.randn_like(initial) for _ in range(3)]
+
+    def run(*, disable_cpp: bool):
+        if disable_cpp:
+            os.environ["FLOWTRAIN_DISABLE_CPU_ADAMW8BIT_CPP"] = "1"
+        else:
+            os.environ.pop("FLOWTRAIN_DISABLE_CPU_ADAMW8BIT_CPP", None)
+        _load_adamw8bit_extension.cache_clear()
+
+        param = torch.nn.Parameter(initial.clone())
+        optimizer = CPU8bitAdamW(
+            [param],
+            lr=1e-3,
+            weight_decay=0.01,
+            min_quantized_numel=0,
+            block_size=256,
+        )
+        for grad in grads:
+            param.grad = grad.clone()
+            optimizer.step()
+        state = optimizer.state[param]
+        return (
+            param.detach().clone(),
+            state["master"].clone(),
+            state["q_exp_avg"].view(-1).clone(),
+            state["exp_avg_scale"].clone(),
+            state["q_exp_avg_sq"].view(-1).clone(),
+            state["exp_avg_sq_scale"].clone(),
+        )
+
+    try:
+        cpp = run(disable_cpp=False)
+        fallback = run(disable_cpp=True)
+    finally:
+        if original_disable is None:
+            os.environ.pop("FLOWTRAIN_DISABLE_CPU_ADAMW8BIT_CPP", None)
+        else:
+            os.environ["FLOWTRAIN_DISABLE_CPU_ADAMW8BIT_CPP"] = original_disable
+        _load_adamw8bit_extension.cache_clear()
+
+    torch.testing.assert_close(cpp[0], fallback[0], rtol=0, atol=3e-7)
+    torch.testing.assert_close(cpp[1], fallback[1], rtol=0, atol=3e-7)
+    assert torch.equal(cpp[2], fallback[2])
+    torch.testing.assert_close(cpp[3], fallback[3], rtol=0, atol=5e-11)
+    assert torch.equal(cpp[4], fallback[4])
+    torch.testing.assert_close(cpp[5], fallback[5], rtol=0, atol=5e-11)
+
+
 def test_batched_copy_cpu_roundtrip():
     destinations = [torch.zeros(2), torch.zeros(3)]
     sources = [torch.ones(2), torch.arange(3, dtype=torch.float32)]
@@ -203,6 +302,16 @@ def test_activation_store_int8_roundtrip_cpu():
     assert v_first_out.dtype == torch.bfloat16
 
 
+def test_activation_store_int8_scale_stays_finite_for_large_values():
+    store = RWKV7ActivationStore(offload="cpu", quant="int8")
+    hidden = torch.full((1, 1, 64), 1.0e8, dtype=torch.bfloat16)
+    checkpoint = store.checkpoint(hidden, has_v_first=False)
+    assert checkpoint.hidden.scale is not None
+    assert checkpoint.hidden.scale.dtype == torch.float32
+    hidden_out, _ = store.unpack(checkpoint, torch.device("cpu"))
+    assert torch.isfinite(hidden_out).all()
+
+
 def test_estimator_reports_positive_batch_for_tiny_model():
     size = RWKV7Size(vocab_size=12, n_layer=2, n_embd=64, dim_ffn=224, lora_rank_style="simplified")
     breakdown = rwkv7_param_breakdown(size)
@@ -237,6 +346,8 @@ def test_estimator_reports_positive_batch_for_tiny_model():
 
 
 def test_sft_jsonl_dataset_masks_prompt_and_collates(tmp_path):
+    import pytest
+
     path = tmp_path / "sft.jsonl"
     path.write_text(
         '{"prompt":"ab","completion":"cd"}\n'
@@ -260,6 +371,43 @@ def test_sft_jsonl_dataset_masks_prompt_and_collates(tmp_path):
     assert batch["input_ids"].shape == batch["labels"].shape
     assert batch["input_ids"][1, -1].item() == tokenizer.pad_token_id
     assert batch["labels"][1, -1].item() == IGNORE_INDEX
+
+    fixed_batch = SFTDataCollator(
+        pad_token_id=tokenizer.pad_token_id,
+        max_length=16,
+        pad_to_multiple_of=8,
+        pad_to_max_length=True,
+    )([first, second])
+    assert fixed_batch["input_ids"].shape == (2, 16)
+    assert fixed_batch["labels"].shape == (2, 16)
+
+    bucket_128 = SFTDataCollator(
+        pad_token_id=tokenizer.pad_token_id,
+        max_length=512,
+        pad_to_buckets=(128, 256, 512),
+    )([{"input_ids": torch.ones(128), "labels": torch.ones(128)}])
+    assert bucket_128["input_ids"].shape == (1, 128)
+    assert bucket_128["labels"].shape == (1, 128)
+
+    bucket_256 = SFTDataCollator(
+        pad_token_id=tokenizer.pad_token_id,
+        max_length=512,
+        pad_to_buckets=(128, 256, 512),
+    )([{"input_ids": torch.ones(129), "labels": torch.ones(129)}])
+    assert bucket_256["input_ids"].shape == (1, 256)
+
+    bucket_512 = SFTDataCollator(
+        pad_token_id=tokenizer.pad_token_id,
+        max_length=512,
+        pad_to_buckets=(128, 256, 512),
+    )([{"input_ids": torch.ones(257), "labels": torch.ones(257)}])
+    assert bucket_512["input_ids"].shape == (1, 512)
+
+    with pytest.raises(ValueError, match="strictly increasing"):
+        SFTDataCollator(
+            pad_token_id=tokenizer.pad_token_id,
+            pad_to_buckets=(256, 128),
+        )([{"input_ids": torch.ones(12), "labels": torch.ones(12)}])
 
 
 def test_rwkv_tokenizer_adapter_matches_sft_interface():

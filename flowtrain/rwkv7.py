@@ -409,6 +409,7 @@ def make_optimizer(
     muon_double_qr: bool = True,
     block_size: int = 256,
     min_quantized_numel: int = 4096,
+    debug_finite_checks: bool = False,
 ):
     from .optimizer import CPU8bitAdamW, CPUAdamW, CPUQRMuon, DeepSpeedCPUAdamW
 
@@ -427,7 +428,12 @@ def make_optimizer(
     if optimizer not in ("adamw", "deepspeed_cpu_adam", "adamw8bit"):
         raise ValueError("optimizer must be 'adamw', 'deepspeed_cpu_adam', 'qr_muon', or 'adamw8bit'")
 
+    param_names: dict[torch.nn.Parameter, str] = {}
     for group in groups:
+        names = group.get("names")
+        if names is not None:
+            for name, param in zip(names, group["params"], strict=True):
+                param_names[param] = name
         group.pop("names", None)
     if optimizer == "deepspeed_cpu_adam":
         return DeepSpeedCPUAdamW(groups, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
@@ -440,6 +446,8 @@ def make_optimizer(
             weight_decay=weight_decay,
             block_size=block_size,
             min_quantized_numel=min_quantized_numel,
+            debug_finite_checks=debug_finite_checks,
+            param_names=param_names,
         )
     return CPUAdamW(groups, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
 

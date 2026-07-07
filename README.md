@@ -506,6 +506,12 @@ Benchmark recurrence kernels:
 python scripts/benchmark_recurrence.py
 ```
 
+Benchmark host<->GPU PCIe copy bandwidth:
+
+```bash
+python scripts/benchmark_pcie_bandwidth.py --bidirectional
+```
+
 ## Tests
 
 CPU-safe API tests:

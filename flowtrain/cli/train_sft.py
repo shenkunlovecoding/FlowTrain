@@ -66,6 +66,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--activation-strategy", choices=("recompute", "store_layer_inputs"), default="recompute")
     parser.add_argument("--logit-chunk-size", type=int, default=128)
     parser.add_argument("--pad-to-multiple-of", type=int, default=None)
+    parser.add_argument(
+        "--pad-to-buckets",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Pad each SFT batch to the smallest listed sequence-length bucket, e.g. 128 256 512",
+    )
+    parser.add_argument(
+        "--pad-to-max-length",
+        action="store_true",
+        help="Pad every SFT batch to --max-length for static sequence shapes",
+    )
+    parser.add_argument(
+        "--debug-finite-checks",
+        action="store_true",
+        help="Raise at the first non-finite loss/logit/gradient/CPU-master parameter",
+    )
     parser.add_argument("--full-sequence-loss", action="store_true", help="Train on prompt tokens too; default masks prompt tokens")
     parser.add_argument("--profile", action="store_true", help="Collect per-step profile (timing/memory/throughput) for infra planning")
     parser.add_argument("--profile-dir", default="runs", help="Directory for profile artifacts")
@@ -114,6 +131,8 @@ def main() -> None:
         pad_token_id=int(tokenizer.pad_token_id),
         max_length=args.max_length,
         pad_to_multiple_of=args.pad_to_multiple_of,
+        pad_to_buckets=args.pad_to_buckets,
+        pad_to_max_length=args.pad_to_max_length,
     )
     dataloader = DataLoader(
         dataset,
@@ -137,6 +156,7 @@ def main() -> None:
             activation_quant=args.activation_quant,
             activation_strategy=args.activation_strategy,
             logit_chunk_size=args.logit_chunk_size,
+            debug_finite_checks=args.debug_finite_checks,
         ),
         checkpoint_ctx_len=args.max_length,
     )
@@ -149,6 +169,7 @@ def main() -> None:
         optimizer=args.optimizer,
         muon_beta=args.muon_beta,
         muon_eps=args.muon_eps,
+        debug_finite_checks=args.debug_finite_checks,
     )
 
     logger.info(
@@ -189,7 +210,12 @@ def main() -> None:
         loss, total_tokens, timing = trainer.forward_and_backward(batch["input_ids"], batch["labels"])
 
         opt_start = time.perf_counter()
+        if args.debug_finite_checks:
+            trainer.check_finite_parameters("before_optimizer")
+            trainer.check_finite_gradients("before_optimizer")
         optimizer.step()
+        if args.debug_finite_checks:
+            trainer.check_finite_parameters("after_optimizer")
         t_opt = time.perf_counter() - opt_start
 
         zero_start = time.perf_counter()

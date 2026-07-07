@@ -93,6 +93,20 @@ def _warn_fallback(reason: str) -> None:
     warnings.warn(f"RWKV7 tilelang_block fallback: {reason}", RuntimeWarning, stacklevel=3)
 
 
+def _debug_enabled(module) -> bool:
+    return bool(getattr(module.config, "debug_finite_checks", False))
+
+
+def _raise_if_nonfinite(name: str, tensor: torch.Tensor) -> None:
+    if torch.isfinite(tensor).all():
+        return
+    bad = int((~torch.isfinite(tensor)).sum().item())
+    raise RuntimeError(
+        f"non-finite tensor: {name} bad={bad} shape={tuple(tensor.shape)} "
+        f"dtype={tensor.dtype} device={tensor.device}"
+    )
+
+
 @lru_cache(maxsize=1)
 def _tilelang_gemm_ops():
     try:
@@ -154,6 +168,9 @@ def _time_mix_tilelang(att, x: torch.Tensor, v_first: torch.Tensor) -> tuple[tor
     tilelang_linear, tilelang_matmul = _tilelang_gemm_ops()
     bsz, timesteps, channels = x.size()
     h = att.n_head
+    debug = _debug_enabled(att)
+    if debug:
+        _raise_if_nonfinite(f"layer_{att.layer_id}:time_mix:input", x)
     can_use_post, time_mix_post_tilelang, can_use_shift, time_mix_shift_tilelang = _tilelang_time_mix_post_ops()
     if (
         os.environ.get("FLOWTRAIN_DISABLE_TIMEMIX_SHIFT_FUSION") != "1"
@@ -174,6 +191,11 @@ def _time_mix_tilelang(att, x: torch.Tensor, v_first: torch.Tensor) -> tuple[tor
     raw_w = att.w0 + _matmul3(torch.tanh(_matmul3(xw, att.w1, tilelang_matmul)), att.w2, tilelang_matmul)
     k = tilelang_linear(xk, att.key.weight)
     v = tilelang_linear(xv, att.value.weight)
+    if debug:
+        _raise_if_nonfinite(f"layer_{att.layer_id}:time_mix:r", r)
+        _raise_if_nonfinite(f"layer_{att.layer_id}:time_mix:raw_w", raw_w)
+        _raise_if_nonfinite(f"layer_{att.layer_id}:time_mix:k", k)
+        _raise_if_nonfinite(f"layer_{att.layer_id}:time_mix:v", v)
     if att.layer_id == 0:
         v_first = v
     else:
@@ -181,15 +203,25 @@ def _time_mix_tilelang(att, x: torch.Tensor, v_first: torch.Tensor) -> tuple[tor
         v = v + (v_first - v) * v_mix
     a = torch.sigmoid(att.a0 + _matmul3(_matmul3(xa, att.a1, tilelang_matmul), att.a2, tilelang_matmul))
     g = _matmul3(torch.sigmoid(_matmul3(xg, att.g1, tilelang_matmul)), att.g2, tilelang_matmul)
+    if debug:
+        _raise_if_nonfinite(f"layer_{att.layer_id}:time_mix:a", a)
+        _raise_if_nonfinite(f"layer_{att.layer_id}:time_mix:g", g)
 
     kk = k * att.k_k
     kk = F.normalize(kk.view(bsz, timesteps, h, -1), dim=-1, p=2.0).view(bsz, timesteps, channels)
     k = k * (1 + (a - 1) * att.k_a)
     neg_kk = -kk
     kk_a = kk * a
+    if debug:
+        _raise_if_nonfinite(f"layer_{att.layer_id}:time_mix:kk", kk)
+        _raise_if_nonfinite(f"layer_{att.layer_id}:time_mix:k_scaled", k)
+        _raise_if_nonfinite(f"layer_{att.layer_id}:time_mix:kk_a", kk_a)
 
     can_use_recurrence, rwkv7_recurrence_tilelang = _tilelang_recurrence_ops()
-    if can_use_recurrence(r, raw_w, k, v, neg_kk, kk_a, att.head_size, att.config.chunk_len):
+    if (
+        os.environ.get("FLOWTRAIN_DISABLE_RECURRENCE_FUSION") != "1"
+        and can_use_recurrence(r, raw_w, k, v, neg_kk, kk_a, att.head_size, att.config.chunk_len)
+    ):
         x = rwkv7_recurrence_tilelang(
             r,
             raw_w.to(dtype=r.dtype),
@@ -204,6 +236,8 @@ def _time_mix_tilelang(att, x: torch.Tensor, v_first: torch.Tensor) -> tuple[tor
         rwkv7_recurrence = _rwkv7_recurrence_ref()
         w = -F.softplus(-raw_w) - 0.5
         x = rwkv7_recurrence(r, w, k, v, neg_kk, kk_a, att.head_size)
+    if debug:
+        _raise_if_nonfinite(f"layer_{att.layer_id}:time_mix:recurrence", x)
 
     if (
         not torch.is_grad_enabled()
@@ -211,6 +245,8 @@ def _time_mix_tilelang(att, x: torch.Tensor, v_first: torch.Tensor) -> tuple[tor
         and can_use_post(x, r, k, v, g, att.r_k, att.ln_x.weight, att.ln_x.bias, att.head_size)
     ):
         x = time_mix_post_tilelang(x, r, k, v, g, att.r_k, att.ln_x.weight, att.ln_x.bias, att.head_size, att.ln_x.eps)
+        if debug:
+            _raise_if_nonfinite(f"layer_{att.layer_id}:time_mix:post_fused", x)
     else:
         x = att.ln_x(x.view(bsz * timesteps, channels)).view(bsz, timesteps, channels)
         x = x + (
@@ -220,22 +256,47 @@ def _time_mix_tilelang(att, x: torch.Tensor, v_first: torch.Tensor) -> tuple[tor
             * v.view(bsz, timesteps, h, -1)
         ).view(bsz, timesteps, channels)
         x = x * g
-    return tilelang_linear(x, att.output.weight), v_first
+        if debug:
+            _raise_if_nonfinite(f"layer_{att.layer_id}:time_mix:post_torch", x)
+    out = tilelang_linear(x, att.output.weight)
+    if debug:
+        _raise_if_nonfinite(f"layer_{att.layer_id}:time_mix:output", out)
+    return out, v_first
 
 
 def _channel_mix_tilelang(ffn, x: torch.Tensor) -> torch.Tensor:
     tilelang_linear, _ = _tilelang_gemm_ops()
+    debug = _debug_enabled(ffn)
+    if debug:
+        _raise_if_nonfinite(f"layer_{ffn.layer_id}:channel_mix:input", x)
     xx = ffn.time_shift(x) - x
     k = x + xx * ffn.x_k
-    return tilelang_linear(torch.relu(tilelang_linear(k, ffn.key.weight)) ** 2, ffn.value.weight)
+    key = tilelang_linear(k, ffn.key.weight)
+    if debug:
+        _raise_if_nonfinite(f"layer_{ffn.layer_id}:channel_mix:key", key)
+    out = tilelang_linear(torch.relu(key) ** 2, ffn.value.weight)
+    if debug:
+        _raise_if_nonfinite(f"layer_{ffn.layer_id}:channel_mix:output", out)
+    return out
 
 
 def _forward_tilelang_gemm(block: RWKV7Block, x: torch.Tensor, v_first: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    debug = _debug_enabled(block)
+    if debug:
+        _raise_if_nonfinite(f"layer_{block.layer_id}:block:input", x)
     if block.layer_id == 0:
         x = block.ln0(x)
+        if debug:
+            _raise_if_nonfinite(f"layer_{block.layer_id}:block:ln0", x)
     x_att, v_first = _time_mix_tilelang(block.att, block.ln1(x), v_first)
+    if debug:
+        _raise_if_nonfinite(f"layer_{block.layer_id}:block:att", x_att)
     x = x + x_att
+    if debug:
+        _raise_if_nonfinite(f"layer_{block.layer_id}:block:after_att", x)
     x = x + _channel_mix_tilelang(block.ffn, block.ln2(x))
+    if debug:
+        _raise_if_nonfinite(f"layer_{block.layer_id}:block:output", x)
     return x, v_first
 
 

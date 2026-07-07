@@ -59,6 +59,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--activation-quant", choices=("none", "int8"), default="none")
     parser.add_argument("--activation-strategy", choices=("recompute", "store_layer_inputs"), default="recompute")
     parser.add_argument("--logit-chunk-size", type=int, default=128)
+    parser.add_argument(
+        "--debug-finite-checks",
+        action="store_true",
+        help="Raise at the first non-finite loss/logit/gradient/CPU-master parameter",
+    )
     return parser.parse_args()
 
 
@@ -91,6 +96,7 @@ def main() -> None:
             activation_quant=args.activation_quant,
             activation_strategy=args.activation_strategy,
             logit_chunk_size=args.logit_chunk_size,
+            debug_finite_checks=args.debug_finite_checks,
         ),
     )
     del model
@@ -104,6 +110,7 @@ def main() -> None:
         optimizer=args.optimizer,
         muon_beta=args.muon_beta,
         muon_eps=args.muon_eps,
+        debug_finite_checks=args.debug_finite_checks,
     )
 
     logger.info(
@@ -124,7 +131,12 @@ def main() -> None:
         labels = input_ids.clone()
 
         loss, total_tokens, timing = trainer.forward_and_backward(input_ids, labels)
+        if args.debug_finite_checks:
+            trainer.check_finite_parameters("before_optimizer")
+            trainer.check_finite_gradients("before_optimizer")
         optimizer.step()
+        if args.debug_finite_checks:
+            trainer.check_finite_parameters("after_optimizer")
         optimizer.zero_grad(set_to_none=True)
         trainer.zero_grad()
 
