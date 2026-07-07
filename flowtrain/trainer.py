@@ -7,7 +7,7 @@ import queue
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import torch
 import torch.nn as nn
@@ -35,6 +35,7 @@ class FlowTrainConfig:
     max_grad_norm: float | None = 1.0
     logit_chunk_size: int = 128
     debug_finite_checks: bool = False
+    debug_stats: bool = False
 
     def __post_init__(self) -> None:
         if self.backend not in ("tilelang", "torch_ref"):
@@ -92,6 +93,57 @@ def _raise_if_nonfinite(name: str, tensor: torch.Tensor) -> None:
         f"non-finite tensor: {name} bad={bad} shape={tuple(tensor.shape)} "
         f"dtype={tensor.dtype} device={tensor.device}{range_text}"
     )
+
+
+def _tensor_debug_stats(prefix: str, tensor: torch.Tensor) -> dict[str, float]:
+    data = tensor.detach().float()
+    finite = torch.isfinite(data)
+    bad = int((~finite).sum().item())
+    if not bool(finite.any().item()):
+        return {
+            f"{prefix}_numel": float(data.numel()),
+            f"{prefix}_bad": float(bad),
+            f"{prefix}_min": float("nan"),
+            f"{prefix}_max": float("nan"),
+            f"{prefix}_mean": float("nan"),
+            f"{prefix}_rms": float("nan"),
+            f"{prefix}_absmax": float("nan"),
+        }
+    values = data[finite]
+    return {
+        f"{prefix}_numel": float(data.numel()),
+        f"{prefix}_bad": float(bad),
+        f"{prefix}_min": float(values.min().item()),
+        f"{prefix}_max": float(values.max().item()),
+        f"{prefix}_mean": float(values.mean().item()),
+        f"{prefix}_rms": float(values.square().mean().sqrt().item()),
+        f"{prefix}_absmax": float(values.abs().max().item()),
+    }
+
+
+def _module_tensor_debug_stats(prefix: str, tensors: list[torch.Tensor]) -> dict[str, float]:
+    total_sq = 0.0
+    total_numel = 0
+    max_abs = 0.0
+    bad = 0
+    for tensor in tensors:
+        data = tensor.detach().float()
+        finite = torch.isfinite(data)
+        bad += int((~finite).sum().item())
+        if not bool(finite.any().item()):
+            total_numel += data.numel()
+            continue
+        values = data[finite]
+        total_sq += float(values.square().sum().item())
+        total_numel += data.numel()
+        max_abs = max(max_abs, float(values.abs().max().item()))
+    norm = total_sq**0.5
+    return {
+        f"{prefix}_numel": float(total_numel),
+        f"{prefix}_bad": float(bad),
+        f"{prefix}_norm": norm,
+        f"{prefix}_absmax": max_abs,
+    }
 
 
 def infer_rwkv7_config_from_state(
@@ -277,6 +329,15 @@ class FlowTrainTrainer:
             if param.grad is not None:
                 _raise_if_nonfinite(f"{stage}:grad:{name}", param.grad)
 
+    def debug_parameter_stats(self, prefix: str = "param") -> dict[str, float]:
+        return _module_tensor_debug_stats(prefix, [param.data for param in self.model.parameters()])
+
+    def debug_gradient_stats(self, prefix: str = "grad") -> dict[str, float]:
+        return _module_tensor_debug_stats(
+            prefix,
+            [param.grad for param in self.model.parameters() if param.grad is not None],
+        )
+
     def cleanup(self) -> None:
         self._drain_grad_tasks(wait_all=True)
         self.grad_accum_executor.shutdown(wait=True)
@@ -295,7 +356,7 @@ class FlowTrainTrainer:
         self,
         input_ids: torch.Tensor,
         labels: torch.Tensor | None = None,
-    ) -> tuple[float, int, dict[str, float]]:
+    ) -> tuple[float, int, dict[str, Any]]:
         if labels is None:
             labels = input_ids
         if input_ids.dim() != 2:
@@ -357,6 +418,7 @@ class FlowTrainTrainer:
         valid_tokens = int((labels[:, 1:] != -100).sum().item())
         if valid_tokens == 0:
             raise ValueError("labels contain no valid next-token targets")
+        debug_stats: dict[str, float] = {}
 
         with torch.cuda.stream(self.compute_stream):
             hidden_before_norm = final_hidden.detach().requires_grad_(True)
@@ -365,18 +427,99 @@ class FlowTrainTrainer:
             hidden_after_norm = norm_gpu(hidden_before_norm)
             if self.config.debug_finite_checks:
                 _raise_if_nonfinite("hidden_before_head", hidden_after_norm)
+            if self.config.debug_stats:
+                debug_stats.update(_tensor_debug_stats("hidden_before_head", hidden_after_norm))
             total_loss = torch.zeros((), device=self.device, dtype=torch.float32)
+            logit_min = float("inf")
+            logit_max = float("-inf")
+            logit_absmax = 0.0
+            target_logit_sum = 0.0
+            target_logit_min = float("inf")
+            target_logit_max = float("-inf")
+            target_margin_sum = 0.0
+            target_margin_min = float("inf")
+            target_margin_max = float("-inf")
+            target_gap_sum = 0.0
+            target_gap_min = float("inf")
+            target_gap_max = float("-inf")
+            nll_sum = 0.0
+            nll_min = float("inf")
+            nll_max = float("-inf")
+            debug_valid = 0
             for start_t in range(0, input_ids.shape[1] - 1, self.config.logit_chunk_size):
                 end_t = min(start_t + self.config.logit_chunk_size, input_ids.shape[1] - 1)
                 logits = head_gpu(hidden_after_norm[:, start_t:end_t, :]).reshape(-1, self.vocab_size).float()
                 if self.config.debug_finite_checks:
                     _raise_if_nonfinite(f"logits[{start_t}:{end_t}]", logits)
                 targets = labels_gpu[:, start_t + 1 : end_t + 1].reshape(-1)
-                total_loss = total_loss + F.cross_entropy(logits, targets, ignore_index=-100, reduction="sum")
+                chunk_loss = F.cross_entropy(logits, targets, ignore_index=-100, reduction="sum")
+                total_loss = total_loss + chunk_loss
+                if self.config.debug_stats:
+                    logit_min = min(logit_min, float(logits.min().item()))
+                    logit_max = max(logit_max, float(logits.max().item()))
+                    logit_absmax = max(logit_absmax, float(logits.abs().max().item()))
+                    valid_mask = targets != -100
+                    chunk_valid = int(valid_mask.sum().item())
+                    if chunk_valid:
+                        valid_logits = logits[valid_mask]
+                        valid_targets = targets[valid_mask]
+                        target_logits = valid_logits.gather(1, valid_targets[:, None]).squeeze(1)
+                        max_logits = valid_logits.max(dim=1).values
+                        top_count = min(2, valid_logits.shape[1])
+                        top_values, top_indices = valid_logits.topk(top_count, dim=1)
+                        if top_count == 1:
+                            max_other = top_values[:, 0]
+                        else:
+                            max_other = torch.where(
+                                top_indices[:, 0] == valid_targets,
+                                top_values[:, 1],
+                                top_values[:, 0],
+                            )
+                        target_margin = target_logits - max_logits
+                        target_gap = target_logits - max_other
+                        nll = -F.log_softmax(valid_logits, dim=1).gather(1, valid_targets[:, None]).squeeze(1)
+
+                        debug_valid += chunk_valid
+                        target_logit_sum += float(target_logits.sum().item())
+                        target_logit_min = min(target_logit_min, float(target_logits.min().item()))
+                        target_logit_max = max(target_logit_max, float(target_logits.max().item()))
+                        target_margin_sum += float(target_margin.sum().item())
+                        target_margin_min = min(target_margin_min, float(target_margin.min().item()))
+                        target_margin_max = max(target_margin_max, float(target_margin.max().item()))
+                        target_gap_sum += float(target_gap.sum().item())
+                        target_gap_min = min(target_gap_min, float(target_gap.min().item()))
+                        target_gap_max = max(target_gap_max, float(target_gap.max().item()))
+                        nll_sum += float(nll.sum().item())
+                        nll_min = min(nll_min, float(nll.min().item()))
+                        nll_max = max(nll_max, float(nll.max().item()))
                 del logits
             loss = total_loss / valid_tokens
             if self.config.debug_finite_checks:
                 _raise_if_nonfinite("loss", loss)
+            if self.config.debug_stats:
+                denom = max(1, debug_valid)
+                debug_stats.update(
+                    {
+                        "valid_tokens": float(valid_tokens),
+                        "ce_sum": float(total_loss.detach().item()),
+                        "loss": float(loss.detach().item()),
+                        "logit_min": logit_min,
+                        "logit_max": logit_max,
+                        "logit_absmax": logit_absmax,
+                        "target_logit_min": target_logit_min,
+                        "target_logit_max": target_logit_max,
+                        "target_logit_mean": target_logit_sum / denom,
+                        "target_margin_min": target_margin_min,
+                        "target_margin_max": target_margin_max,
+                        "target_margin_mean": target_margin_sum / denom,
+                        "target_gap_min": target_gap_min,
+                        "target_gap_max": target_gap_max,
+                        "target_gap_mean": target_gap_sum / denom,
+                        "nll_min": nll_min,
+                        "nll_max": nll_max,
+                        "nll_mean": nll_sum / denom,
+                    }
+                )
             loss.backward()
             loss_value_tensor = loss.detach().float()
 
@@ -453,12 +596,15 @@ class FlowTrainTrainer:
 
         torch.cuda.synchronize(self.device)
         bwd_end = time.perf_counter()
-        return loss_val, input_ids.numel(), {
+        timing: dict[str, Any] = {
             "forward": fwd_end - start,
             "backward": bwd_end - fwd_end,
             "total": bwd_end - start,
             "activation_bytes_per_sample": self.activation_store.offloaded_bytes / max(1, input_ids.shape[0]),
         }
+        if self.config.debug_stats:
+            timing["debug"] = debug_stats
+        return loss_val, input_ids.numel(), timing
 
     def _replay_one_layer_backward(
         self,

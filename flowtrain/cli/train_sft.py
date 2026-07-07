@@ -84,6 +84,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Raise at the first non-finite loss/logit/gradient/CPU-master parameter",
     )
+    parser.add_argument(
+        "--debug-stats",
+        action="store_true",
+        help="Log internal loss/logit/gradient/parameter statistics for diagnosing silent saturation",
+    )
     parser.add_argument("--full-sequence-loss", action="store_true", help="Train on prompt tokens too; default masks prompt tokens")
     parser.add_argument("--profile", action="store_true", help="Collect per-step profile (timing/memory/throughput) for infra planning")
     parser.add_argument("--profile-dir", default="runs", help="Directory for profile artifacts")
@@ -111,6 +116,63 @@ def _build_model(args: argparse.Namespace, vocab_size: int) -> RWKV7 | str:
             backend=args.backend,
             chunk_len=args.chunk_len,
         )
+    )
+
+
+def _log_forward_debug(step: int, debug: dict[str, float]) -> None:
+    logger.info(
+        (
+            "debug step=%d loss=%.8e ce_sum=%.6e valid=%d "
+            "hidden_rms=%.6g hidden_absmax=%.6g "
+            "logit_min=%.6g logit_max=%.6g logit_absmax=%.6g "
+            "target_logit_mean=%.6g target_gap_mean=%.6g target_gap_min=%.6g "
+            "nll_mean=%.6g nll_min=%.6g nll_max=%.6g"
+        ),
+        step,
+        debug.get("loss", float("nan")),
+        debug.get("ce_sum", float("nan")),
+        int(debug.get("valid_tokens", 0.0)),
+        debug.get("hidden_before_head_rms", float("nan")),
+        debug.get("hidden_before_head_absmax", float("nan")),
+        debug.get("logit_min", float("nan")),
+        debug.get("logit_max", float("nan")),
+        debug.get("logit_absmax", float("nan")),
+        debug.get("target_logit_mean", float("nan")),
+        debug.get("target_gap_mean", float("nan")),
+        debug.get("target_gap_min", float("nan")),
+        debug.get("nll_mean", float("nan")),
+        debug.get("nll_min", float("nan")),
+        debug.get("nll_max", float("nan")),
+    )
+
+
+def _log_optimizer_debug(
+    step: int,
+    grad_stats: dict[str, float],
+    param_before: dict[str, float],
+    param_after: dict[str, float],
+    opt_grad_norm: object,
+) -> None:
+    try:
+        opt_grad_norm_float = float(opt_grad_norm) if opt_grad_norm is not None else float("nan")
+    except (TypeError, ValueError):
+        opt_grad_norm_float = float("nan")
+    logger.info(
+        (
+            "debug step=%d grad_norm=%.6g grad_absmax=%.6g grad_bad=%d "
+            "opt_grad_norm=%.6g param_norm_before=%.6g param_norm_after=%.6g "
+            "param_absmax_before=%.6g param_absmax_after=%.6g param_bad_after=%d"
+        ),
+        step,
+        grad_stats.get("grad_norm", float("nan")),
+        grad_stats.get("grad_absmax", float("nan")),
+        int(grad_stats.get("grad_bad", 0.0)),
+        opt_grad_norm_float,
+        param_before.get("param_before_norm", float("nan")),
+        param_after.get("param_after_norm", float("nan")),
+        param_before.get("param_before_absmax", float("nan")),
+        param_after.get("param_after_absmax", float("nan")),
+        int(param_after.get("param_after_bad", 0.0)),
     )
 
 
@@ -158,6 +220,7 @@ def main() -> None:
             activation_strategy=args.activation_strategy,
             logit_chunk_size=args.logit_chunk_size,
             debug_finite_checks=args.debug_finite_checks,
+            debug_stats=args.debug_stats,
         ),
         checkpoint_ctx_len=args.max_length,
     )
@@ -209,14 +272,21 @@ def main() -> None:
         t_data = time.perf_counter() - data_start
 
         loss, total_tokens, timing = trainer.forward_and_backward(batch["input_ids"], batch["labels"])
+        if args.debug_stats:
+            _log_forward_debug(step + 1, timing.get("debug", {}))
 
         opt_start = time.perf_counter()
         if args.debug_finite_checks:
             trainer.check_finite_parameters("before_optimizer")
             trainer.check_finite_gradients("before_optimizer")
-        optimizer.step()
+        grad_stats = trainer.debug_gradient_stats("grad") if args.debug_stats else {}
+        param_before = trainer.debug_parameter_stats("param_before") if args.debug_stats else {}
+        opt_grad_norm = optimizer.step()
         if args.debug_finite_checks:
             trainer.check_finite_parameters("after_optimizer")
+        if args.debug_stats:
+            param_after = trainer.debug_parameter_stats("param_after")
+            _log_optimizer_debug(step + 1, grad_stats, param_before, param_after, opt_grad_norm)
         t_opt = time.perf_counter() - opt_start
 
         zero_start = time.perf_counter()
