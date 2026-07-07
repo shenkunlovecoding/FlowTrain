@@ -7,3 +7,4 @@ __pycache__/
 *:Zone.Identifier
 MegaTrain/
 runs*/
+data/dolly-rwkv-15k.jsonl

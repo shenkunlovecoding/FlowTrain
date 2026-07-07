@@ -371,6 +371,10 @@ def test_sft_jsonl_dataset_masks_prompt_and_collates(tmp_path):
     assert batch["input_ids"].shape == batch["labels"].shape
     assert batch["input_ids"][1, -1].item() == tokenizer.pad_token_id
     assert batch["labels"][1, -1].item() == IGNORE_INDEX
+    next_token_targets = batch["labels"][:, 1:]
+    current_tokens = batch["input_ids"][:, :-1]
+    assert not torch.equal(next_token_targets, current_tokens)
+    assert next_token_targets[1][next_token_targets[1] != IGNORE_INDEX].tolist() == [6, 7]
 
     fixed_batch = SFTDataCollator(
         pad_token_id=tokenizer.pad_token_id,
