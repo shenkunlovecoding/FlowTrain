@@ -10,7 +10,13 @@ import torch
 from torch.utils.data import DataLoader
 
 from flowtrain import FlowTrainConfig, FlowTrainTrainer, RWKV7, RWKV7Config, make_optimizer
-from flowtrain.sft_data import RWKVTokenizerAdapter, SFTDataCollator, SFTJsonlDataset
+from flowtrain.sft_data import (
+    LengthBucketBatchSampler,
+    RWKVTokenizerAdapter,
+    SFTDataCollator,
+    SFTJsonlDataset,
+    compute_sft_lengths,
+)
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
@@ -78,6 +84,21 @@ def parse_args() -> argparse.Namespace:
         "--pad-to-max-length",
         action="store_true",
         help="Pad every SFT batch to --max-length for static sequence shapes",
+    )
+    parser.add_argument(
+        "--length-bucket-batch",
+        action="store_true",
+        help="Group SFT samples into length-homogeneous batches (one bucket per batch) to "
+        "minimize padding and keep TileLang kernel shapes static. Requires --pad-to-buckets; "
+        "every --pad-to-buckets value and --max-length must be a multiple of --chunk-len "
+        "for the tilelang backend.",
+    )
+    parser.add_argument(
+        "--length-bucket-drop-tail",
+        action="store_true",
+        help="With --length-bucket-batch, drop each bucket's final short batch so every batch "
+        "is exactly --batch-size (keeps the batch dimension a static TileLang JIT key). Default "
+        "keeps all samples, accepting ~one extra per-bucket (remainder, bucket) specialization.",
     )
     parser.add_argument(
         "--debug-finite-checks",
@@ -197,15 +218,70 @@ def main() -> None:
         pad_to_buckets=args.pad_to_buckets,
         pad_to_max_length=args.pad_to_max_length,
     )
-    dataloader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        drop_last=False,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        collate_fn=collator,
-    )
+    if args.length_bucket_batch:
+        if not args.pad_to_buckets:
+            raise SystemExit(
+                "--length-bucket-batch requires --pad-to-buckets (e.g. --pad-to-buckets 64 128 256)"
+            )
+        if args.pad_to_max_length:
+            logger.warning(
+                "--pad-to-max-length is redundant under --length-bucket-batch "
+                "(--max-length is already the implicit final bucket)"
+            )
+        if args.backend == "tilelang":
+            for value in (*args.pad_to_buckets, args.max_length):
+                if value % args.chunk_len != 0:
+                    raise SystemExit(
+                        f"--pad-to-buckets/--max-length value {value} must be a multiple of "
+                        f"--chunk-len ({args.chunk_len}) for the tilelang backend"
+                    )
+    if args.length_bucket_batch:
+        sampler = LengthBucketBatchSampler(
+            dataset,
+            lengths=compute_sft_lengths(dataset),
+            batch_size=args.batch_size,
+            buckets=args.pad_to_buckets,
+            max_length=args.max_length,
+            shuffle=True,
+            drop_last=args.length_bucket_drop_tail,
+            seed=args.seed,
+        )
+        if len(sampler) == 0:
+            raise SystemExit(
+                "--length-bucket-batch: no full batches can be formed; "
+                "lower --batch-size or add more data"
+            )
+        batches_per_epoch = len(sampler)
+        logger.info(
+            "length-bucket sampler: batches_per_epoch=%d drop_tail=%s buckets=%s",
+            batches_per_epoch,
+            args.length_bucket_drop_tail,
+            args.pad_to_buckets,
+        )
+        if batches_per_epoch < args.num_steps:
+            logger.warning(
+                "--num-steps (%d) > batches_per_epoch (%d); the bucket sampler will be "
+                "iterated multiple times (reseeded each epoch)",
+                args.num_steps,
+                batches_per_epoch,
+            )
+        dataloader = DataLoader(
+            dataset,
+            batch_sampler=sampler,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            collate_fn=collator,
+        )
+    else:
+        dataloader = DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            drop_last=False,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            collate_fn=collator,
+        )
 
     trainer = FlowTrainTrainer(
         _build_model(args, vocab_size),
@@ -297,12 +373,14 @@ def main() -> None:
         t_step = time.perf_counter() - step_start
 
         valid_targets = int((batch["labels"][:, 1:] != -100).sum().item())
+        util = 100.0 * valid_targets / total_tokens if total_tokens else 0.0
         logger.info(
-            "step=%d loss=%.4f tokens=%d valid_targets=%d time=%.3fs fwd=%.3fs bwd=%.3fs opt=%.3fs act=%.4f GB/sample",
+            "step=%d loss=%.4f tokens=%d valid_targets=%d util=%.1f%% time=%.3fs fwd=%.3fs bwd=%.3fs opt=%.3fs act=%.4f GB/sample",
             step + 1,
             loss,
             total_tokens,
             valid_targets,
+            util,
             timing["total"],
             timing["forward"],
             timing["backward"],

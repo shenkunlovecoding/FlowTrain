@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
+import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 
 
 IGNORE_INDEX = -100
@@ -47,16 +48,64 @@ def _truncate_pair(input_ids: list[int], labels: list[int], max_length: int | No
     return input_ids[:max_length], labels[:max_length]
 
 
-def _pad_length_to_bucket(length: int, buckets: Sequence[int]) -> int:
+def _validate_buckets(buckets: Sequence[int]) -> list[int]:
     bucket_values = [int(bucket) for bucket in buckets]
     if any(bucket <= 0 for bucket in bucket_values):
         raise ValueError("pad_to_buckets values must be positive")
     if bucket_values != sorted(set(bucket_values)):
         raise ValueError("pad_to_buckets values must be strictly increasing")
+    return bucket_values
+
+
+def _pad_length_to_bucket(length: int, buckets: Sequence[int]) -> int:
+    bucket_values = _validate_buckets(buckets)
     for bucket in bucket_values:
         if length <= bucket:
             return bucket
     return length
+
+
+def _effective_buckets(
+    buckets: Sequence[int] | None, max_length: int | None
+) -> list[int]:
+    """Effective bucket set shared by the collator and the length-bucket sampler.
+
+    ``max_length`` is treated as the implicit final bucket so every sample
+    length (already truncated to ``max_length`` upstream by the dataset) maps
+    onto a finite set of seq_len targets — long-tail samples no longer leak
+    past the largest declared bucket as a non-bucket seq_len. Buckets larger
+    than ``max_length`` are dropped. With ``max_length is None`` the raw
+    buckets are returned unchanged, preserving the legacy behavior where
+    lengths past the largest bucket stay unrounded.
+    """
+    raw = list(buckets) if buckets is not None else []
+    kept = [int(b) for b in raw if max_length is None or b <= max_length]
+    if max_length is not None:
+        kept.append(int(max_length))
+    return sorted(set(kept))
+
+
+def _round_seq_len_to_bucket(
+    length: int, buckets: Sequence[int] | None, max_length: int | None
+) -> int:
+    """Round ``length`` up to the smallest effective bucket >= length.
+
+    Single source of truth shared by :class:`SFTDataCollator` and
+    :class:`LengthBucketBatchSampler`. Because both round with the same
+    ``(buckets, max_length)``, the collator's within-batch-max rounding always
+    lands on the same bucket the sampler assigned to that batch (no metadata
+    needs to be threaded between them). With an empty effective set (no
+    buckets and no ``max_length``) returns ``length`` unchanged.
+    """
+    if buckets is not None:
+        # Validate the raw user-provided order before _effective_buckets sorts
+        # it, so a non-increasing bucket list still raises (mirrors the legacy
+        # _pad_length_to_bucket contract relied on by the collator).
+        _validate_buckets(buckets)
+    effective = _effective_buckets(buckets, max_length)
+    if not effective:
+        return length
+    return _pad_length_to_bucket(length, effective)
 
 
 class RWKVTokenizerAdapter:
@@ -217,9 +266,7 @@ class SFTDataCollator:
             if self.max_length is not None:
                 max_len = min(max_len, self.max_length)
         if self.pad_to_buckets:
-            max_len = _pad_length_to_bucket(max_len, self.pad_to_buckets)
-            if self.max_length is not None:
-                max_len = min(max_len, self.max_length)
+            max_len = _round_seq_len_to_bucket(max_len, self.pad_to_buckets, self.max_length)
         if self.pad_to_multiple_of:
             multiple = self.pad_to_multiple_of
             max_len = ((max_len + multiple - 1) // multiple) * multiple
@@ -248,3 +295,115 @@ class SFTDataCollator:
             "input_ids": torch.stack(input_rows, dim=0),
             "labels": torch.stack(label_rows, dim=0),
         }
+
+
+def compute_sft_lengths(dataset: SFTJsonlDataset) -> list[int]:
+    """Tokenize every record once and return per-sample, post-truncation lengths.
+
+    Mirrors :meth:`SFTJsonlDataset.__getitem__` exactly by reusing
+    ``_encode_record`` + :func:`_truncate_pair`, so the lengths agree with what
+    the collator sees at train time. Runs once in the main process (before
+    DataLoader construction) so a length-bucket sampler can group samples
+    without re-tokenizing per epoch or coupling to worker-process state.
+    Records that produce fewer than two tokens raise, matching the
+    ``__getitem__`` invariant.
+    """
+    lengths: list[int] = []
+    max_length = dataset.max_length
+    for record in dataset.records:
+        input_ids, _labels = dataset._encode_record(record)
+        input_ids, _labels = _truncate_pair(input_ids, _labels, max_length)
+        if len(input_ids) < 2:
+            raise ValueError("SFT samples must produce at least two tokens")
+        lengths.append(len(input_ids))
+    return lengths
+
+
+class LengthBucketBatchSampler(Sampler[list[int]]):
+    """Group dataset indices into sequence-length-homogeneous batches.
+
+    Each sample is assigned to a bucket via :func:`_round_seq_len_to_bucket`
+    (with ``max_length`` as the implicit final bucket); batches are formed
+    within a single bucket so that, after the collator pads to the *same*
+    rounding function, every batch's seq_len is exactly that bucket. This keeps
+    TileLang kernel shapes static (one specialization per bucket instead of one
+    per random shuffle) and minimizes padding, since samples sharing a batch
+    have similar length.
+
+    Sampler/collator consistency holds as long as both round with the same
+    ``(buckets, max_length)``: if every sample in a batch rounds to bucket k,
+    so does the within-batch max. The bucket-batch CLI path builds both from
+    the same ``--pad-to-buckets`` / ``--max-length`` to guarantee this.
+    """
+
+    def __init__(
+        self,
+        dataset: Dataset,
+        lengths: Sequence[int],
+        batch_size: int,
+        buckets: Sequence[int] | None,
+        *,
+        max_length: int | None,
+        shuffle: bool = True,
+        drop_last: bool = False,
+        seed: int = 0,
+    ) -> None:
+        if len(lengths) != len(dataset):
+            raise ValueError(
+                f"lengths has {len(lengths)} entries but dataset has {len(dataset)} samples"
+            )
+        if batch_size < 1:
+            raise ValueError("batch_size must be >= 1")
+        effective = _effective_buckets(buckets, max_length)
+        if not effective:
+            raise ValueError(
+                "LengthBucketBatchSampler requires at least one effective bucket; "
+                "pass buckets or set max_length"
+            )
+        if buckets is not None:
+            _validate_buckets(buckets)
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.buckets = list(buckets) if buckets is not None else None
+        self.max_length = max_length
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+        self.seed = seed
+        self._epoch = 0
+        groups: dict[int, list[int]] = {}
+        for index, length in enumerate(lengths):
+            bucket = _round_seq_len_to_bucket(length, buckets, max_length)
+            groups.setdefault(bucket, []).append(index)
+        # Deterministic bucket order so __len__ and iteration are stable.
+        self._groups: list[tuple[int, list[int]]] = sorted(groups.items())
+        self._num_batches = self._compute_num_batches()
+
+    def _compute_num_batches(self) -> int:
+        total = 0
+        for _bucket, indices in self._groups:
+            count = len(indices)
+            if self.drop_last:
+                total += count // self.batch_size
+            else:
+                total += -(-count // self.batch_size)  # ceil(count / batch_size)
+        return total
+
+    def __iter__(self):
+        rng = random.Random(self.seed + self._epoch)
+        self._epoch += 1
+        all_batches: list[list[int]] = []
+        for _bucket, indices in self._groups:
+            bucket_indices = list(indices)
+            if self.shuffle:
+                rng.shuffle(bucket_indices)
+            for start in range(0, len(bucket_indices), self.batch_size):
+                batch = bucket_indices[start : start + self.batch_size]
+                if len(batch) < self.batch_size and self.drop_last:
+                    continue
+                all_batches.append(batch)
+        if self.shuffle:
+            rng.shuffle(all_batches)
+        return iter(all_batches)
+
+    def __len__(self) -> int:
+        return self._num_batches
